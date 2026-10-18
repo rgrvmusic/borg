@@ -8,8 +8,9 @@ preload object, same pid, with no rootfs writes.
 
 ![](./docs/borg-screen.png)
 
-The loaded object adds a status menu, opened with MUTE and MASTER, and an
-optional MIDI note and velocity transform. Build with
+The loaded object adds a status menu, opened with MUTE and MASTER, an optional
+MIDI note and velocity transform, and a loader for `.borgmodule` pages kept in
+the instrument's userfs. Build with
 `./build-drum.sh borg_drumlogue`. Install and use are in
 [borg_drumlogue/README.md](borg_drumlogue/README.md).
 

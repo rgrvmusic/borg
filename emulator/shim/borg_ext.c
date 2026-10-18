@@ -15,6 +15,7 @@
  * No process and no thread is created; the hooks run on the daemon's own. */
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -28,13 +29,27 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "borg_module.h"
+
 #ifndef LOGUE_BORG_MIDI_LOG
 #define LOGUE_BORG_MIDI_LOG "/tmp/logue-borg-midi.log"
 #endif
 
+#ifndef LOGUE_BORG_MODULE_DIR
+#define LOGUE_BORG_MODULE_DIR "/var/lib/drumlogued/userfs/Programs/borg_modules"
+#endif
+
+#ifndef LOGUE_BORG_MODULE_LOG
+#define LOGUE_BORG_MODULE_LOG "/var/lib/drumlogued/userfs/Programs/borg-modules.log"
+#endif
+
 #define PANEL_FDS_MAX 8
 #define CAPTURE_MAX 8192
-#define PAGES 2
+#define MODULE_MAX 8
+#define MODULE_FILE_MAX 96
+#define MODULE_DIR_MAX 256
+#define MODULE_PATH_MAX 512
+#define MODULE_PAGE_BASE 2
 
 /* The daemon's own key indices, measured from the panel. */
 #define KEY_MASTER 0x0f
@@ -251,9 +266,192 @@ static void menu_row(unsigned y, const char* label, const char* value) {
   put_text(128, y, 128, 8, cell);
 }
 
+/* --------------------------------------------------------------- the modules
+ *
+ * A .borgmodule is an ordinary ARM shared object with its own suffix. The
+ * loader runs on the panel thread at the first panel read or write: never in a
+ * constructor, because that window kills this daemon, and never on the audio
+ * path, because dlopen takes the loader lock. The loaded set is published in
+ * one atomic store and never freed or unloaded. A module that fails to load is
+ * logged and skipped; it never takes the daemon with it. */
+
+typedef struct module_set {
+  int n_modules;
+  int n_pages;
+  const borg_module* mod[MODULE_MAX];
+} module_set;
+
+static module_set* module_set_live;
+static int module_load_state;           /* 0 idle, 1 loading, 2 loaded */
+
+static void module_logf(const char* fmt, ...) {
+  char msg[256];
+  char line[320];
+  va_list ap;
+
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof msg, fmt, ap);
+  va_end(ap);
+  snprintf(line, sizeof line, "borg module: %s\n", msg);
+  raw_log(LOGUE_BORG_MODULE_LOG, line);
+}
+
+static void host_log(const char* line) {
+  if (line != NULL) module_logf("%s", line);
+}
+
+static const char* host_path(int which) {
+  if (which == BORG_PATH_TMP) return "/tmp";
+  return "/var/lib/drumlogued/userfs/Programs";
+}
+
+static void host_text(unsigned x, unsigned y, unsigned w, unsigned h,
+                      const char* s) {
+  if (panel_out_fd >= 0 && s != NULL) put_text(x, y, w, h, s);
+}
+
+static void host_dark(unsigned x, unsigned y, unsigned w, unsigned h,
+                      const char* s) {
+  if (panel_out_fd >= 0 && s != NULL) put_dark(x, y, w, h, s);
+}
+
+static void host_row(unsigned y, const char* label, const char* value) {
+  if (panel_out_fd >= 0) menu_row(y, label != NULL ? label : "",
+                                  value != NULL ? value : "");
+}
+
+static const borg_host host_services = {
+  (uint32_t)sizeof(borg_host), BORG_MODULE_ABI,
+  host_log, host_path, host_text, host_dark, host_row
+};
+
+static int module_suffix(const char* name) {
+  static const char ext[] = ".borgmodule";
+  const size_t n = strlen(name);
+  const size_t e = sizeof ext - 1;
+
+  return n > e && strcmp(name + n - e, ext) == 0;
+}
+
+static int module_name_sort(const void* a, const void* b) {
+  return strcmp((const char*)a, (const char*)b);
+}
+
+static void ensure_open(void);
+
+static void modules_load(void) {
+  int expected = 0;
+  int i, n_names = 0;
+  module_set* set;
+  const char* override;
+  char dir[MODULE_DIR_MAX];
+  char path[MODULE_PATH_MAX];
+  char names[MODULE_MAX][MODULE_FILE_MAX];
+  DIR* d;
+  struct dirent* e;
+
+  if (!__atomic_compare_exchange_n(&module_load_state, &expected, 1, 0,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    return;
+  }
+
+  /* Resolve the real open before dlopen holds the loader lock, so the opens
+   * that dlopen itself makes do not try to resolve through it. */
+  ensure_open();
+
+  set = (module_set*)calloc(1, sizeof *set);
+  if (set == NULL) {
+    raw_log(LOGUE_BORG_MODULE_LOG, "borg module: out of memory\n");
+    __atomic_store_n(&module_load_state, 2, __ATOMIC_RELEASE);
+    return;
+  }
+
+  override = getenv("LOGUE_BORG_MODULE_DIR");
+  if (override == NULL || *override == '\0') override = LOGUE_BORG_MODULE_DIR;
+  snprintf(dir, sizeof dir, "%s", override);
+
+  d = opendir(dir);
+  if (d == NULL) {
+    module_logf("no module directory %s", dir);
+  } else {
+    while ((e = readdir(d)) != NULL && n_names < MODULE_MAX) {
+      if (!module_suffix(e->d_name)) continue;
+      snprintf(names[n_names], MODULE_FILE_MAX, "%s", e->d_name);
+      n_names++;
+    }
+    closedir(d);
+  }
+
+  qsort(names, (size_t)n_names, MODULE_FILE_MAX, module_name_sort);
+
+  for (i = 0; i < n_names; i++) {
+    void* handle;
+    borg_module_entry_fn entry;
+    const borg_module* m;
+
+    snprintf(path, sizeof path, "%.*s/%.*s", (int)sizeof dir - 1, dir,
+             (int)sizeof names[0] - 1, names[i]);
+    handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) {
+      module_logf("%s: %s", path, dlerror());
+      continue;
+    }
+    dlerror();
+    entry = (borg_module_entry_fn)dlsym(handle, BORG_MODULE_ENTRY);
+    if (entry == NULL) {
+      module_logf("%s: no %s", path, BORG_MODULE_ENTRY);
+      continue;
+    }
+    m = entry(BORG_MODULE_ABI);
+    if (m == NULL || m->abi != BORG_MODULE_ABI) {
+      module_logf("%s: ABI %u not %u", path,
+                  (unsigned)(m != NULL ? m->abi : 0u), BORG_MODULE_ABI);
+      continue;
+    }
+    if (m->init != NULL && m->init(&host_services, path) != 0) {
+      module_logf("%s: init refused", path);
+      continue;
+    }
+    set->mod[set->n_modules++] = m;
+    if ((m->capabilities & BORG_CAP_PAGE) != 0 && m->page_draw != NULL &&
+        m->name != NULL) {
+      set->n_pages++;
+    }
+    module_logf("loaded %s %s", m->name != NULL ? m->name : "?",
+                m->version != NULL ? m->version : "");
+  }
+
+  __atomic_store_n(&module_set_live, set, __ATOMIC_RELEASE);
+  __atomic_store_n(&module_load_state, 2, __ATOMIC_RELEASE);
+}
+
+static int page_count(void) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+
+  return MODULE_PAGE_BASE + (set != NULL ? set->n_pages : 0);
+}
+
+static const borg_module* page_module(int page) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i, seen = 0;
+
+  if (set == NULL || page < MODULE_PAGE_BASE) return NULL;
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if ((m->capabilities & BORG_CAP_PAGE) == 0 || m->page_draw == NULL ||
+        m->name == NULL) {
+      continue;
+    }
+    if (seen == page - MODULE_PAGE_BASE) return m;
+    seen++;
+  }
+  return NULL;
+}
+
 static void menu_draw(void) {
   unsigned char fill[12];
   char value[24];
+  char tab[BORG_TAB_MAX];
 
   if (panel_out_fd < 0) return;
 
@@ -261,6 +459,13 @@ static void menu_draw(void) {
    * role 0. */
   raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 0, 256, 64));
   raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 0, 256, 8));
+  /* Clear the row area separately. The whole-screen fill is the daemon's own
+   * page-entry preamble, but the panel service holds a full fill until an
+   * item commits it, and the title-band fill above replaces what it holds.
+   * A page with fewer rows than the one before it would then leave the old
+   * rows behind. On the instrument the whole-screen fill has already cleared
+   * them; this fills the same area again so both ends agree. */
+  raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 24, 256, 40));
 
   /* The title band is the daemon's own title row: light text on the dark page,
    * centred, in the same frame the daemon gives -PROGRAM SELECT-. */
@@ -274,11 +479,30 @@ static void menu_draw(void) {
   put_text(192, 14, 10, 8, "<");
   put_text(246, 14, 10, 8, ">");
   if (menu_page == 0) {
-    put_text(64, 14, 64, 8, "MIDI");
     put_dark(0, 12, 64, 8, "STATUS");
   } else {
     put_text(0, 14, 64, 8, "STATUS");
+  }
+  if (menu_page == 1) {
     put_dark(64, 12, 64, 8, "MIDI");
+  } else {
+    put_text(64, 14, 64, 8, "MIDI");
+  }
+  /* The third cell carries the first module's tab, or the active module's tab
+   * while one of their pages is open. It is the same 64-wide cell as STATUS,
+   * MIDI, BANK and TARGET. A name is cut to the cell's 7 characters. */
+  {
+    const borg_module* tab_module =
+        menu_page >= MODULE_PAGE_BASE ? page_module(menu_page)
+                                      : page_module(MODULE_PAGE_BASE);
+    if (tab_module != NULL) {
+      snprintf(tab, sizeof tab, "%s", tab_module->name);
+      if (menu_page >= MODULE_PAGE_BASE) {
+        put_dark(128, 12, 64, 8, tab);
+      } else {
+        put_text(128, 14, 64, 8, tab);
+      }
+    }
   }
 
   if (menu_page == 0) {
@@ -297,7 +521,7 @@ static void menu_draw(void) {
     menu_row(44, "AUDIO CALLS:", value);
     snprintf(value, sizeof value, "%lu / %lu", audio_errors, menu_opens);
     menu_row(53, "XRUNS/OPENS:", value);
-  } else {
+  } else if (menu_page == 1) {
     snprintf(value, sizeof value, "%lu / %lu B", midi_in_bytes, midi_out_bytes);
     menu_row(26, "MIDI I/O:", value);
     snprintf(value, sizeof value, "%lu / %lu", midi_in_msgs, midi_notes);
@@ -307,6 +531,9 @@ static void menu_draw(void) {
     menu_row(44, "LAST NOTE:", value);
     snprintf(value, sizeof value, "%+d / %d%%", midi_transpose, midi_velocity);
     menu_row(53, "TRANS/VEL:", value);
+  } else {
+    const borg_module* m = page_module(menu_page);
+    if (m != NULL && m->page_draw != NULL) m->page_draw();
   }
 }
 
@@ -434,6 +661,7 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
   static unsigned char out[4096];
   size_t in = 0, o = 0, inserts = 0;
   panel_out_fd = fd;
+  modules_load();
 
   /* Every kept frame is emitted once, so the output is the input plus one
    * three-byte down per held key delivered. The caller's buffer is always
@@ -498,11 +726,12 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
       }
 
       if (down && !chord && menu_open) {
+        const int pages = page_count();
         if (key == KEY_PAGE_DOWN) {
-          menu_page = (menu_page + 1) % PAGES;
+          menu_page = (menu_page + 1) % pages;
           menu_draw();
         } else if (key == KEY_PAGE_UP) {
-          menu_page = (menu_page + PAGES - 1) % PAGES;
+          menu_page = (menu_page + pages - 1) % pages;
           menu_draw();
         }
       }
@@ -631,6 +860,10 @@ ssize_t write(int fd, const void* buf, size_t n) {
   size_t i = 0;
 
   if (!panel_is(fd)) return (ssize_t)syscall(SYS_write, fd, buf, n);
+
+  /* The daemon paints as soon as it is up, so this usually loads the modules
+   * before the first key is pressed. The loader is off the audio path. */
+  modules_load();
 
   /* With the menu closed the write goes through untouched; it is parsed only
    * to keep the replay current. */

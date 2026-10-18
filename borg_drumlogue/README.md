@@ -50,9 +50,9 @@ it names the unit's own process, so a stale marker cannot hide the ready state.
 
 ## Extensions
 
-The loaded object adds a status menu and a MIDI note transform to the running
-daemon. Neither starts a process or a thread; both run in the daemon's own
-process.
+The loaded object adds a status menu, a MIDI note transform and a
+`.borgmodule` loader to the running daemon. None of them starts a process or a
+thread; they run in the daemon's own process.
 
 ### Status menu
 
@@ -89,6 +89,49 @@ Incoming notes can be transposed and note-on velocity scaled:
 The variables are read when the object loads. Real-time messages, system
 exclusive data and running status are passed through unchanged.
 
+### Modules
+
+A `.borgmodule` adds a page to the menu. It is an ordinary shared object kept
+in the instrument's userfs at `userfs/Programs/borg_modules/`, built against
+`emulator/shim/borg_module.h`.
+
+Modules are loaded once, on the first panel read or write after the switch. A
+file whose entry point or ABI does not match is written to
+`userfs/Programs/borg-modules.log` and skipped; the rest still load. A module
+that loads is never unloaded while the daemon runs. A module copied into the
+directory after that point is picked up on the next switch, not by reopening
+the menu.
+
+ABI 1 offers one menu page:
+
+| Field | Meaning |
+|---|---|
+| `name` | tab title, at most 7 characters |
+| `version` | free-form version string |
+| `capabilities` | `BORG_CAP_PAGE` for a menu page |
+| `init` | called once, off the audio path |
+| `page_draw` | called on the panel thread while the page is active |
+
+The host reads `abi` first and never reads past the layout that ABI names.
+Fields are only appended, never reordered or removed. `init` receives the host
+services (log, module path, text, dark text, row) and the module's own path. A
+module may draw its page but not clear the screen, and it may not create a
+process or a thread.
+
+Build the example:
+
+```sh
+./build-module.sh modules/hello/hello.c
+```
+
+That writes `modules/hello/hello.borgmodule`. Copy it to
+`userfs/Programs/borg_modules/` on the instrument before selecting the unit.
+Its `HELLO` tab sits after the built-in tabs; PAGE DOWN reaches it, and the page
+shows `MODULE:` and `Hello, module!`.
+
+`LOGUE_BORG_MODULE_DIR` overrides the module directory, which is useful for a
+test tree.
+
 
 ## Logs
 
@@ -96,6 +139,7 @@ exclusive data and running status are passed through unchanged.
 |---|---|
 | `userfs/Programs/borg-exec.log` | pre-switch state and any refusal |
 | `userfs/Programs/borg-shim.log` | attach confirmation from the loaded object |
+| `userfs/Programs/borg-modules.log` | module load and skip lines |
 | `/tmp/logue-borg-unit.log` | unit-side errors |
 | `/tmp/logue-borg-midi.log` | transformed MIDI notes |
 
