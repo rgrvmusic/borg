@@ -48,6 +48,13 @@ static int panel_out_fd = -1;
 
 static int menu_open;
 static int menu_page;
+/* The daemon's panel mode, from its id 4 command: 1 for the sequencer views
+ * (LIVE, STEP, ACCENT), 0 for an ordinary page. The sequencer views are kept
+ * by the panel itself, so the menu never draws over them: it switches to page
+ * mode, draws there, and switches back with the id 4 command. Painting over
+ * that view and replaying a capture garbles it, because its state is retained
+ * and not fully expressed in the screen frames. */
+static int view_mode;
 static int mute_held;
 static int master_held;
 static int chord_latch;
@@ -115,6 +122,7 @@ static int panel_is(int fd) {
 static void panel_reset(void) {
   menu_open = 0;
   menu_page = 0;
+  view_mode = 0;
   mute_held = 0;
   master_held = 0;
   chord_latch = 0;
@@ -149,9 +157,16 @@ static void panel_del(int fd) {
   if (n_panel_fds == 0) panel_reset();
 }
 
-/* One class-0x85 id 0 frame: box header, then the text (at most 51 chars). */
+/* One class-0x85 id 0 frame: box header, then the text (at most 51 chars).
+ *
+ * The two colour bytes are the ink and the field behind it, in that order.
+ * The daemon writes `0f 00` for titles, values and part names (light ink on the
+ * dark page) and `00 0f` for parameter names (dark ink on a light field). Menu
+ * rows use the title pair, so no light field appears behind them; a cell with
+ * a light field uses the label pair. The menu draws in page mode, so the kind
+ * is 0. */
 static size_t screen_frame(unsigned char* out, unsigned char role,
-                           unsigned char fg, unsigned char bg,
+                           unsigned char ink, unsigned char field,
                            unsigned x, unsigned y, unsigned w, unsigned h,
                            const char* text) {
   size_t n = strlen(text);
@@ -160,8 +175,8 @@ static size_t screen_frame(unsigned char* out, unsigned char role,
   out[1] = (unsigned char)(13 + n);
   out[2] = 0x00;
   out[3] = role;
-  out[4] = fg;
-  out[5] = bg;
+  out[4] = ink;
+  out[5] = field;
   out[6] = (unsigned char)(x & 0x7f);
   out[7] = (unsigned char)((x >> 7) & 0x7f);
   out[8] = (unsigned char)y;
@@ -174,7 +189,10 @@ static size_t screen_frame(unsigned char* out, unsigned char role,
 }
 
 /* One class-0x85 id 1 frame: a region fill. Role 0 is the page background;
- * role 0x0f is the light band the daemon puts behind a field name. */
+ * role 0x0f paints a light band for dark-ink text. The daemon paints the band
+ * first and draws the text into it; the text frame's field byte alone does not
+ * paint it on the instrument. The menu draws in page mode, so the kind is 0 as
+ * on the daemon's pages. */
 static size_t fill_frame(unsigned char* out, unsigned char role,
                          unsigned x, unsigned y, unsigned w, unsigned h) {
   out[0] = 0x85;
@@ -188,16 +206,17 @@ static size_t fill_frame(unsigned char* out, unsigned char role,
   out[8] = (unsigned char)(w & 0x7f);
   out[9] = (unsigned char)((w >> 7) & 0x7f);
   out[10] = (unsigned char)h;
-  out[11] = 0x00;                             /* kind */
+  out[11] = 0x00;
   return 12;
 }
 
 /* Role 0 is the daemon's label and title style, the small font. Role 2 is the
  * large value style, which does not fit six rows on a 64-unit screen. */
 static void put_styled(unsigned x, unsigned y, unsigned w, unsigned h,
-                       unsigned char fg, unsigned char bg, const char* text) {
+                       unsigned char ink, unsigned char field,
+                       const char* text) {
   unsigned char frame[64];
-  const size_t n = screen_frame(frame, 0x20, fg, bg, x, y, w, h, text);
+  const size_t n = screen_frame(frame, 0x20, ink, field, x, y, w, h, text);
   if (panel_out_fd >= 0) raw_write(panel_out_fd, frame, n);
 }
 
@@ -206,21 +225,28 @@ static void put_text(unsigned x, unsigned y, unsigned w, unsigned h,
   put_styled(x, y, w, h, 0x0f, 0x00, text);
 }
 
-static void put_label(unsigned x, unsigned y, unsigned w, unsigned h,
-                      const char* text) {
-  put_styled(x, y, w, h, 0x00, 0x0f, text);
+/* Dark ink for a cell that carries its own light field. The daemon's inverse
+ * label cell is a 12-high role 0x0f band with 8-high text inset by 2: BANK and
+ * TARGET on the PROGRAM SELECT page are sent exactly this way. Matching that
+ * shape matters; the panel does not invert an 8-high band with the text flush
+ * against its edges. */
+static void put_dark(unsigned x, unsigned y, unsigned w, unsigned h,
+                     const char* text) {
+  unsigned char fill[12];
+
+  if (panel_out_fd < 0) return;
+  raw_write(panel_out_fd, fill, fill_frame(fill, 0x0f, x, y, w, 12));
+  put_styled(x, y + 2, w, h, 0x00, 0x0f, text);
 }
 
-/* A field name on the left and its value right-aligned on the right. The
- * name sits on the light band the daemon uses for field names; the value is
- * drawn from its right edge, so a column of numbers lines up. */
+/* A field name on the left and its value right-aligned on the right. Both are
+ * light on the dark page: a light band behind the name is hard to read at this
+ * size, so the column and the gap do the separating. */
 static void menu_row(unsigned y, const char* label, const char* value) {
-  unsigned char fill[12];
   char cell[16];
 
-  raw_write(panel_out_fd, fill, fill_frame(fill, 0x0f, 0, y, 120, 8));
   snprintf(cell, sizeof cell, "%-12s", label);
-  put_label(0, y, 120, 8, cell);
+  put_text(0, y, 120, 8, cell);
   snprintf(cell, sizeof cell, "%12s", value);
   put_text(128, y, 128, 8, cell);
 }
@@ -231,29 +257,34 @@ static void menu_draw(void) {
 
   if (panel_out_fd < 0) return;
 
-  /* The page starts from black. A one-unit light rule under the tab bar is
-   * the same fill the daemon puts behind a label, so it reads as a divider
-   * rather than as another text row. */
+  /* The daemon's page preamble: the whole screen, then the title band, both
+   * role 0. */
   raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 0, 256, 64));
-  raw_write(panel_out_fd, fill, fill_frame(fill, 0x0f, 0, 9, 256, 1));
+  raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 0, 256, 8));
 
-  /* Two tabs, the active one as a light band with dark text. The arrows at
-   * the edges sit where the two page keys act. */
-  raw_write(panel_out_fd, fill,
-            fill_frame(fill, 0x0f, menu_page == 0 ? 10 : 128, 0, 118, 8));
-  put_styled(10, 0, 118, 8,
-             menu_page == 0 ? 0x00 : 0x0f, menu_page == 0 ? 0x0f : 0x00,
-             menu_page == 0 ? " [ STATUS ]" : "   STATUS  ");
-  put_styled(128, 0, 118, 8,
-             menu_page == 1 ? 0x00 : 0x0f, menu_page == 1 ? 0x0f : 0x00,
-             menu_page == 1 ? " [ MIDI ]  " : "    MIDI   ");
-  put_text(0, 0, 10, 8, "<");
-  put_text(246, 0, 10, 8, ">");
+  /* The title band is the daemon's own title row: light text on the dark page,
+   * centred, in the same frame the daemon gives -PROGRAM SELECT-. */
+  put_text(64, 2, 128, 8, "-BORG-");
+
+  /* The tab bar sits in the label row at y=12, as 64-wide cells, exactly like
+   * BANK and TARGET. That is the only inverse cell the instrument is proven to
+   * draw; an identical band in the title row stays white on white. Both tab
+   * texts sit at y=14, the inset the daemon gives an inverse label. The arrows
+   * at the right sit where the two page keys act. */
+  put_text(192, 14, 10, 8, "<");
+  put_text(246, 14, 10, 8, ">");
+  if (menu_page == 0) {
+    put_text(64, 14, 64, 8, "MIDI");
+    put_dark(0, 12, 64, 8, "STATUS");
+  } else {
+    put_text(0, 14, 64, 8, "STATUS");
+    put_dark(64, 12, 64, 8, "MIDI");
+  }
 
   if (menu_page == 0) {
     const long up = (long)(time(NULL) - start_epoch);
     snprintf(value, sizeof value, "%d", (int)getpid());
-    menu_row(11, "DAEMON PID:", value);
+    menu_row(26, "DAEMON PID:", value);
     if (up >= 3600) {
       snprintf(value, sizeof value, "%ldH %02ldM", up / 3600, (up / 60) % 60);
     } else if (up >= 60) {
@@ -261,44 +292,50 @@ static void menu_draw(void) {
     } else {
       snprintf(value, sizeof value, "%ld S", up);
     }
-    menu_row(20, "UPTIME:", value);
+    menu_row(35, "UPTIME:", value);
     snprintf(value, sizeof value, "%lu", audio_calls);
-    menu_row(29, "AUDIO CALLS:", value);
-    snprintf(value, sizeof value, "%lu/S",
-             up > 0 ? audio_calls / (unsigned long)up : 0UL);
-    menu_row(38, "AUDIO RATE:", value);
-    snprintf(value, sizeof value, "%lu", audio_errors);
-    menu_row(47, "AUDIO XRUNS:", value);
-    snprintf(value, sizeof value, "%lu", menu_opens);
-    menu_row(56, "MENU OPENS:", value);
+    menu_row(44, "AUDIO CALLS:", value);
+    snprintf(value, sizeof value, "%lu / %lu", audio_errors, menu_opens);
+    menu_row(53, "XRUNS/OPENS:", value);
   } else {
-    snprintf(value, sizeof value, "%lu B", midi_in_bytes);
-    menu_row(11, "MIDI IN:", value);
-    snprintf(value, sizeof value, "%lu B", midi_out_bytes);
-    menu_row(20, "MIDI OUT:", value);
+    snprintf(value, sizeof value, "%lu / %lu B", midi_in_bytes, midi_out_bytes);
+    menu_row(26, "MIDI I/O:", value);
     snprintf(value, sizeof value, "%lu / %lu", midi_in_msgs, midi_notes);
-    menu_row(29, "MSGS/NOTES:", value);
+    menu_row(35, "MSGS/NOTES:", value);
     snprintf(value, sizeof value, "%02lX %02lX %02lX", midi_last_status,
              midi_last_note, midi_last_vel);
-    menu_row(38, "LAST NOTE:", value);
-    snprintf(value, sizeof value, "%+d", midi_transpose);
-    menu_row(47, "TRANSPOSE:", value);
-    snprintf(value, sizeof value, "%d%%", midi_velocity);
-    menu_row(56, "VELOCITY:", value);
+    menu_row(44, "LAST NOTE:", value);
+    snprintf(value, sizeof value, "%+d / %d%%", midi_transpose, midi_velocity);
+    menu_row(53, "TRANS/VEL:", value);
   }
 }
 
 static void menu_show(int fd) {
+  static const unsigned char page_mode[4] = {0x85, 0x04, 0x04, 0x00};
+  static const unsigned char view_reset[4] = {0x85, 0x04, 0x09, 0x02};
   panel_out_fd = fd;
   menu_open = 1;
   menu_page = 0;
   menu_opens++;
+  /* The daemon begins every view change with id 4 (page or sequencer mode) and
+   * id 9, then the page fills. Both commands are part of the page context the
+   * inverse labels are drawn in; copying only the fills left the active tab in
+   * the wrong video state on the instrument. */
+  if (view_mode == 1) raw_write(fd, page_mode, sizeof page_mode);
+  raw_write(fd, view_reset, sizeof view_reset);
   menu_draw();
 }
 
 static void menu_hide(int fd) {
+  static const unsigned char seq_mode[4] = {0x85, 0x04, 0x04, 0x01};
   unsigned char fill[12];
   menu_open = 0;
+  if (view_mode == 1) {
+    /* Switch back to the view the panel has been keeping. Nothing is erased or
+     * replayed on top of it, which is what keeps it intact. */
+    raw_write(fd, seq_mode, sizeof seq_mode);
+    return;
+  }
   /* Erase the menu first: the replay below is the daemon's screen as it was,
    * and it does not have to repaint every box the menu used. */
   raw_write(fd, fill, fill_frame(fill, 0x00, 0, 0, 256, 64));
@@ -332,6 +369,13 @@ static void capture_append(const unsigned char* f, size_t n) {
 
 static void capture_frame(const unsigned char* f, size_t n) {
   if (n < 3) return;
+
+  /* The daemon's id 4 command names the panel mode: 1 for the sequencer view
+   * it keeps, 0 for an ordinary page. Track it even while the menu is open, so
+   * closing switches to whatever the daemon last asked for. */
+  if (f[2] == 0x04 && n == 4) {
+    view_mode = f[3] & 1;
+  }
 
   if (f[2] == 0x01 && n == 12) {
     const unsigned w = (unsigned)f[8] | ((unsigned)f[9] << 7);
@@ -584,36 +628,42 @@ ssize_t read(int fd, void* buf, size_t n) {
 
 ssize_t write(int fd, const void* buf, size_t n) {
   const unsigned char* p = (const unsigned char*)buf;
-  unsigned char kept[512];
-  size_t i = 0, out = 0;
+  size_t i = 0;
 
   if (!panel_is(fd)) return (ssize_t)syscall(SYS_write, fd, buf, n);
 
-  /* The daemon writes one small frame at a time. A larger buffer is passed
-   * through untouched rather than parsed on a guess. */
-  if (n > sizeof kept) return (ssize_t)syscall(SYS_write, fd, buf, n);
+  /* With the menu closed the write goes through untouched; it is parsed only
+   * to keep the replay current. */
+  if (!menu_open) {
+    const ssize_t got = (ssize_t)syscall(SYS_write, fd, buf, n);
+    if (got <= 0) return got;
+    while (i < n) {
+      const size_t len = out_frame_len(p + i, n - i);
+      if (len == 0) break;
+      if (p[i] == 0x85) capture_frame(p + i, len);
+      i += len;
+    }
+    return got;
+  }
 
+  /* With the menu open every screen frame is dropped, however large the write
+   * is and wherever the frame sits in it. The main page can refresh in one
+   * buffer much bigger than a single frame; passing that through would paint
+   * over the menu. The lamps and the other classes are kept, one frame at a
+   * time. */
   while (i < n) {
-    const size_t len = out_frame_len(p + i, n - i);
+    size_t len = out_frame_len(p + i, n - i);
     if (len == 0) {
-      memcpy(kept + out, p + i, n - i);
-      out += n - i;
-      break;
+      if (p[i] == 0x85) break;      /* screen data that cannot be measured */
+      len = n - i;
     }
     if (p[i] == 0x85) {
       capture_frame(p + i, len);
-      if (!menu_open) {
-        memcpy(kept + out, p + i, len);
-        out += len;
-      }
-    } else if (out + len <= sizeof kept) {
-      memcpy(kept + out, p + i, len);
-      out += len;
+    } else if (len > 0 && syscall(SYS_write, fd, p + i, len) < 0) {
+      return -1;
     }
     i += len;
   }
-
-  if (out > 0 && syscall(SYS_write, fd, kept, out) < 0) return -1;
   return (ssize_t)n;
 }
 

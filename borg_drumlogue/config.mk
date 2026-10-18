@@ -1,4 +1,4 @@
-PROJECT      := borg_drumlogue
+PROJECT      := borg
 PROJECT_TYPE := synth
 
 CSRC  = header.c

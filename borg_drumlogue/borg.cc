@@ -652,8 +652,23 @@ void SetUp(uint32_t samplerate) {
   g_rate = samplerate ? samplerate : 48000;
   g_frames = 0;
   g_request = 0;
+
+  /* The shim marks the daemon it attached to. A child inherits the variable
+   * but is not the marked process, so the pid has to name this one. Without
+   * that check a stale marker would report ACTIVE and swallow GateOn in a
+   * daemon that has no shim. */
   const char* active = getenv("LOGUE_BORG_ACTIVE");
-  g_phase = (active != nullptr && active[0] == '1') ? kActive : kReady;
+  const char* marked = getenv("LOGUE_BORG_PID");
+  g_phase = kReady;
+  if (active != nullptr && active[0] == '1') {
+    if (marked != nullptr && atoi(marked) == static_cast<int>(getpid())) {
+      g_phase = kActive;
+    } else {
+      LogUnit("borg: marker ignored: attached pid %s, this pid %ld\n",
+              marked != nullptr ? marked : "(unset)",
+              static_cast<long>(getpid()));
+    }
+  }
   RedrawNow();
 }
 

@@ -62,8 +62,11 @@ build_unit() {
     # The container user needs to write build/ and .dep/.
     chmod 777 "$unit" 2>/dev/null || true
 
-    # Remove host-owned build outputs before entering the container.
+    # Remove host-owned build outputs before entering the container. The
+    # installed artifact is removed too, so a renamed PROJECT cannot leave the
+    # previous name behind for the find below to pick up.
     rm -rf "$unit/build" "$unit/.dep" 2>/dev/null || true
+    rm -f "$unit"/*.drmlgunit 2>/dev/null || true
 
     # Build the embedded shim before borg_blob.S includes it.
     if [ "$unit" = borg_drumlogue ]; then

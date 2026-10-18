@@ -23,13 +23,12 @@ be overridden:
 CONTAINER_IMAGE=... ./build-drum.sh borg_drumlogue
 ```
 
-Output: `bin/borg_drumlogue.drmlgunit`.
+Output: `bin/borg.drmlgunit`.
 
 
 ## Install and use
 
-1. Copy `bin/borg_drumlogue.drmlgunit` to `userfs/Units/Synths/` on the
-   instrument.
+1. Copy `bin/borg.drmlgunit` to `userfs/Units/Synths/` on the instrument.
 2. Load the unit on a part.
 3. Save the program. The daemon reloads the saved program after the switch;
    without the unit in it, the confirmation screen will not return.
@@ -43,6 +42,11 @@ Output: `bin/borg_drumlogue.drmlgunit`.
 | `!active` | `BORG ACTIVE` / `EXTENSIONS LOADED` | the object is loaded; gates are ignored |
 | `!err` | `BORG FAILED` / `NOTHING CHANGED` | the switch was refused; the daemon is unchanged |
 
+`!active` describes the daemon, not the press that showed the unit. Once the
+daemon runs with the object, every showing of the unit reads ACTIVE until a
+power cycle, including after a program reload. The marker is only believed when
+it names the unit's own process, so a stale marker cannot hide the ready state.
+
 
 ## Extensions
 
@@ -55,12 +59,17 @@ process.
 Hold MUTE and press MASTER (the sixteenth part key) to open the menu. The same
 chord closes it.
 
-The menu draws a tab bar across the top, with an arrow at each edge. PAGE UP
-and PAGE DOWN move between the tabs, and the active tab is shown inverted.
+The menu draws `-BORG-` in the title band, a tab bar in the label row, and both
+paging arrows after the tabs. PAGE UP and PAGE DOWN move between the tabs; the
+active one carries a light field with dark text. The rows are light text on the
+dark page, with no light field behind the names. The main sequencer views are
+kept by the panel itself, so the menu does not paint over them: it switches the
+panel to page mode, draws there, and switches back when it closes. Both the
+pages and the sequencer views reopen with their own content intact.
 
 | Tab | Shows |
 |---|---|
-| STATUS | daemon pid, uptime, audio calls and rate, audio xruns, menu opens |
+| STATUS | daemon pid, uptime, audio calls, audio xruns and menu opens |
 | MIDI | MIDI bytes in and out, messages and notes, the last note, transpose and velocity |
 
 The menu draws over the daemon's screen, and the daemon's last screen is
