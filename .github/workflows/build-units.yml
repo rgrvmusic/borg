@@ -1,0 +1,42 @@
+name: Build units
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+  pull_request: {}
+
+jobs:
+  build-units:
+    name: Build units (drumlogue)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Install container tools
+        uses: gbraad-actions/setup-container-tools@v1
+
+      - name: Check out the logue SDK
+        run: |
+          mkdir -p $HOME/Projects/logue
+          git clone --depth 1 https://github.com/korginc/logue-sdk.git $HOME/Projects/logue/logue-sdk
+
+      # The platform directory is mounted at /workspace, which is the build
+      # user's HOME inside the image, where the SDK's environment script writes
+      # its backup. A fresh clone is not writable by the user the image remaps
+      # onto, so the environment aborts before the cross toolchain is on PATH.
+      - name: Make the platform directory writable by the container
+        run: chmod 777 $HOME/Projects/logue/logue-sdk/platform
+
+      - name: Build the unit
+        run: ./build-drum.sh borg_drumlogue
+
+      - name: Upload Artifact - unit
+        uses: actions/upload-artifact@v4
+        with:
+          name: borg-drumlogue-unit
+          path: bin/
+          retention-days: 7

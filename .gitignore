@@ -1,0 +1,5 @@
+# artifacts and build
+*.drmlgunit
+/*/.dep
+/*/build
+
