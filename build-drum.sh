@@ -79,7 +79,8 @@ build_unit() {
                 source /app/drumlogue/environment
                 cd /workspace/drumlogue/$unit
                 \${CROSS_COMPILE}gcc -shared -fPIC -O2 -Wall -Wextra \
-                    -o libborg.so /nthost/shim/borg_shim.c
+                    -o libborg.so /nthost/shim/borg_shim.c \
+                    /nthost/shim/borg_ext.c -ldl
             "
     fi
 

@@ -44,6 +44,40 @@ Output: `bin/borg_drumlogue.drmlgunit`.
 | `!err` | `BORG FAILED` / `NOTHING CHANGED` | the switch was refused; the daemon is unchanged |
 
 
+## Extensions
+
+The loaded object adds a status menu and a MIDI note transform to the running
+daemon. Neither starts a process or a thread; both run in the daemon's own
+process.
+
+### Status menu
+
+Hold MUTE and press MASTER (the sixteenth part key) to open the menu. The same
+chord closes it.
+
+| Page | Shows |
+|---|---|
+| 1 | daemon pid, uptime, audio writes, audio errors |
+| 2 | MIDI bytes in and out, messages and notes, the last note, transpose and velocity settings |
+
+PAGE UP and PAGE DOWN move between the pages while the menu is open. The menu
+draws over the daemon's screen, and the daemon's last screen is restored when
+it closes. The opening MASTER press, the page keys and the closing MASTER press
+are held back from the daemon; every other key and the lamps behave as before.
+
+### MIDI note transform
+
+Incoming notes can be transposed and note-on velocity scaled:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOGUE_BORG_MIDI_TRANSPOSE` | `0` | semitones added to every note, clamped to 0 to 127 |
+| `LOGUE_BORG_MIDI_VELOCITY` | `100` | note-on velocity as a percentage, 1 to 200 |
+
+The variables are read when the object loads. Real-time messages, system
+exclusive data and running status are passed through unchanged.
+
+
 ## Logs
 
 | Path | Contents |
@@ -51,6 +85,7 @@ Output: `bin/borg_drumlogue.drmlgunit`.
 | `userfs/Programs/borg-exec.log` | pre-switch state and any refusal |
 | `userfs/Programs/borg-shim.log` | attach confirmation from the loaded object |
 | `/tmp/logue-borg-unit.log` | unit-side errors |
+| `/tmp/logue-borg-midi.log` | transformed MIDI notes |
 
 
 ## Notes
