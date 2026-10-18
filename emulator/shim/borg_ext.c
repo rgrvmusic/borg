@@ -35,8 +35,11 @@
 #define LOGUE_BORG_MIDI_LOG "/tmp/logue-borg-midi.log"
 #endif
 
+/* Modules live directly in Programs, next to the unit and log directories.
+ * A subdirectory is not scanned: the instrument's userfs is the only place a
+ * module is expected. */
 #ifndef LOGUE_BORG_MODULE_DIR
-#define LOGUE_BORG_MODULE_DIR "/var/lib/drumlogued/userfs/Programs/borg_modules"
+#define LOGUE_BORG_MODULE_DIR "/var/lib/drumlogued/userfs/Programs"
 #endif
 
 #ifndef LOGUE_BORG_MODULE_LOG
@@ -268,21 +271,28 @@ static void menu_row(unsigned y, const char* label, const char* value) {
 
 /* --------------------------------------------------------------- the modules
  *
- * A .borgmodule is an ordinary ARM shared object with its own suffix. The
- * loader runs on the panel thread at the first panel read or write: never in a
- * constructor, because that window kills this daemon, and never on the audio
- * path, because dlopen takes the loader lock. The loaded set is published in
- * one atomic store and never freed or unloaded. A module that fails to load is
- * logged and skipped; it never takes the daemon with it. */
+ * A .borgmodule is an ordinary ARM shared object with its own suffix, kept
+ * directly in the userfs Programs directory. The first scan runs on the panel
+ * thread at the first panel read or write: never in a constructor, because that
+ * window kills this daemon, and never on the audio path, because dlopen takes
+ * the loader lock. The directory is scanned again whenever the menu opens, so a
+ * module copied while the daemon runs shows up without another switch. The
+ * loaded set is published in one atomic store and is never freed or unloaded.
+ * A module that fails to load is logged and skipped; it never takes the daemon
+ * with it, and it is not retried on every menu open. */
 
 typedef struct module_set {
   int n_modules;
   int n_pages;
   const borg_module* mod[MODULE_MAX];
+  char name[MODULE_MAX][MODULE_FILE_MAX];
+  int n_tried;
+  char tried[MODULE_MAX][MODULE_FILE_MAX];
 } module_set;
 
 static module_set* module_set_live;
 static int module_load_state;           /* 0 idle, 1 loading, 2 loaded */
+static int module_rescan_busy;
 
 static void module_logf(const char* fmt, ...) {
   char msg[256];
@@ -339,16 +349,103 @@ static int module_name_sort(const void* a, const void* b) {
 
 static void ensure_open(void);
 
-static void modules_load(void) {
-  int expected = 0;
-  int i, n_names = 0;
-  module_set* set;
-  const char* override;
-  char dir[MODULE_DIR_MAX];
+/* A name that was attempted is never attempted again: the file may have been
+ * replaced with one that still fails, and a failed file must not fill the log
+ * on every menu open. It is remembered across rescans with the loaded set. */
+static int module_tried(const module_set* set, const char* name) {
+  int i;
+
+  for (i = 0; i < set->n_tried; i++) {
+    if (strcmp(set->tried[i], name) == 0) return 1;
+  }
+  return 0;
+}
+
+static void module_note_tried(module_set* set, const char* name) {
+  if (set->n_tried < MODULE_MAX) {
+    snprintf(set->tried[set->n_tried], MODULE_FILE_MAX, "%s", name);
+    set->n_tried++;
+  }
+}
+
+static void module_load_file(module_set* set, const char* dir,
+                             const char* name) {
   char path[MODULE_PATH_MAX];
+  void* handle;
+  borg_module_entry_fn entry;
+  const borg_module* m;
+  int slot;
+
+  if (set->n_modules >= MODULE_MAX || module_tried(set, name)) return;
+  module_note_tried(set, name);
+
+  snprintf(path, sizeof path, "%.*s/%.*s", MODULE_DIR_MAX - 1, dir,
+           MODULE_FILE_MAX - 1, name);
+  handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (handle == NULL) {
+    module_logf("%s: %s", path, dlerror());
+    return;
+  }
+  dlerror();
+  entry = (borg_module_entry_fn)dlsym(handle, BORG_MODULE_ENTRY);
+  if (entry == NULL) {
+    module_logf("%s: no %s", path, BORG_MODULE_ENTRY);
+    return;
+  }
+  m = entry(BORG_MODULE_ABI);
+  if (m == NULL || m->abi != BORG_MODULE_ABI) {
+    module_logf("%s: ABI %u not %u", path,
+                (unsigned)(m != NULL ? m->abi : 0u), BORG_MODULE_ABI);
+    return;
+  }
+  if (m->init != NULL && m->init(&host_services, path) != 0) {
+    module_logf("%s: init refused", path);
+    return;
+  }
+  slot = set->n_modules;
+  set->mod[slot] = m;
+  snprintf(set->name[slot], MODULE_FILE_MAX, "%s", name);
+  set->n_modules = slot + 1;
+  if ((m->capabilities & BORG_CAP_PAGE) != 0 && m->page_draw != NULL &&
+      m->name != NULL) {
+    set->n_pages++;
+  }
+  module_logf("loaded %s %s", m->name != NULL ? m->name : "?",
+              m->version != NULL ? m->version : "");
+}
+
+static void module_scan_dir(module_set* set, const char* dir) {
+  int i, n_names = 0;
   char names[MODULE_MAX][MODULE_FILE_MAX];
   DIR* d;
   struct dirent* e;
+
+  d = opendir(dir);
+  if (d == NULL) {
+    module_logf("no module directory %s", dir);
+    return;
+  }
+  while ((e = readdir(d)) != NULL && n_names < MODULE_MAX) {
+    if (!module_suffix(e->d_name)) continue;
+    snprintf(names[n_names], MODULE_FILE_MAX, "%s", e->d_name);
+    n_names++;
+  }
+  closedir(d);
+
+  qsort(names, (size_t)n_names, MODULE_FILE_MAX, module_name_sort);
+  for (i = 0; i < n_names; i++) module_load_file(set, dir, names[i]);
+}
+
+static const char* module_dir(void) {
+  const char* override = getenv("LOGUE_BORG_MODULE_DIR");
+
+  if (override != NULL && *override != '\0') return override;
+  return LOGUE_BORG_MODULE_DIR;
+}
+
+static void modules_load(void) {
+  int expected = 0;
+  module_set* set;
 
   if (!__atomic_compare_exchange_n(&module_load_state, &expected, 1, 0,
                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
@@ -366,63 +463,44 @@ static void modules_load(void) {
     return;
   }
 
-  override = getenv("LOGUE_BORG_MODULE_DIR");
-  if (override == NULL || *override == '\0') override = LOGUE_BORG_MODULE_DIR;
-  snprintf(dir, sizeof dir, "%s", override);
-
-  d = opendir(dir);
-  if (d == NULL) {
-    module_logf("no module directory %s", dir);
-  } else {
-    while ((e = readdir(d)) != NULL && n_names < MODULE_MAX) {
-      if (!module_suffix(e->d_name)) continue;
-      snprintf(names[n_names], MODULE_FILE_MAX, "%s", e->d_name);
-      n_names++;
-    }
-    closedir(d);
-  }
-
-  qsort(names, (size_t)n_names, MODULE_FILE_MAX, module_name_sort);
-
-  for (i = 0; i < n_names; i++) {
-    void* handle;
-    borg_module_entry_fn entry;
-    const borg_module* m;
-
-    snprintf(path, sizeof path, "%.*s/%.*s", (int)sizeof dir - 1, dir,
-             (int)sizeof names[0] - 1, names[i]);
-    handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (handle == NULL) {
-      module_logf("%s: %s", path, dlerror());
-      continue;
-    }
-    dlerror();
-    entry = (borg_module_entry_fn)dlsym(handle, BORG_MODULE_ENTRY);
-    if (entry == NULL) {
-      module_logf("%s: no %s", path, BORG_MODULE_ENTRY);
-      continue;
-    }
-    m = entry(BORG_MODULE_ABI);
-    if (m == NULL || m->abi != BORG_MODULE_ABI) {
-      module_logf("%s: ABI %u not %u", path,
-                  (unsigned)(m != NULL ? m->abi : 0u), BORG_MODULE_ABI);
-      continue;
-    }
-    if (m->init != NULL && m->init(&host_services, path) != 0) {
-      module_logf("%s: init refused", path);
-      continue;
-    }
-    set->mod[set->n_modules++] = m;
-    if ((m->capabilities & BORG_CAP_PAGE) != 0 && m->page_draw != NULL &&
-        m->name != NULL) {
-      set->n_pages++;
-    }
-    module_logf("loaded %s %s", m->name != NULL ? m->name : "?",
-                m->version != NULL ? m->version : "");
-  }
-
+  module_scan_dir(set, module_dir());
   __atomic_store_n(&module_set_live, set, __ATOMIC_RELEASE);
   __atomic_store_n(&module_load_state, 2, __ATOMIC_RELEASE);
+}
+
+/* Called when the menu opens, on the panel thread. A module copied into
+ * Programs while the daemon runs is picked up here, without another switch.
+ * The loaded modules are never unloaded; a new set is published only when the
+ * scan found something new, so a reader never sees a half-built one. */
+static void modules_rescan(void) {
+  const module_set* live;
+  module_set* set;
+  int before_modules, before_tried, expected = 0;
+
+  if (__atomic_load_n(&module_load_state, __ATOMIC_ACQUIRE) != 2) return;
+  if (!__atomic_compare_exchange_n(&module_rescan_busy, &expected, 1, 0,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    return;
+  }
+
+  ensure_open();
+  live = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  set = (module_set*)calloc(1, sizeof *set);
+  if (set == NULL) {
+    __atomic_store_n(&module_rescan_busy, 0, __ATOMIC_RELEASE);
+    return;
+  }
+  if (live != NULL) *set = *live;
+
+  before_modules = set->n_modules;
+  before_tried = set->n_tried;
+  module_scan_dir(set, module_dir());
+  if (set->n_modules != before_modules || set->n_tried != before_tried) {
+    __atomic_store_n(&module_set_live, set, __ATOMIC_RELEASE);
+  } else {
+    free(set);
+  }
+  __atomic_store_n(&module_rescan_busy, 0, __ATOMIC_RELEASE);
 }
 
 static int page_count(void) {
@@ -550,6 +628,8 @@ static void menu_show(int fd) {
    * the wrong video state on the instrument. */
   if (view_mode == 1) raw_write(fd, page_mode, sizeof page_mode);
   raw_write(fd, view_reset, sizeof view_reset);
+  /* A module copied since the load point is picked up here. */
+  modules_rescan();
   menu_draw();
 }
 

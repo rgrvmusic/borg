@@ -1,8 +1,8 @@
 /* The smallest useful .borgmodule: one tab and one field.
  *
  * It proves the loader, the ABI handshake and the menu page without touching
- * audio or MIDI. Build it with ../../build-module.sh and copy the result to
- * userfs/Programs/borg_modules/ on the instrument. */
+ * audio or MIDI. Build it with ../../build-module.sh and copy the result
+ * directly to userfs/Programs/ on the instrument. */
 
 #include "borg_module.h"
 
@@ -17,7 +17,7 @@ static int hello_init(const borg_host* host, const char* module_path) {
 
 static void hello_page(void) {
   if (g_host != NULL && g_host->row != NULL) {
-    g_host->row(26, "MODULE:", "Hello, module!");
+    g_host->row(26, "MODULE:", "HELLO MODULE");
   }
 }
 

@@ -4,7 +4,7 @@
 #   ./build-module.sh modules/hello/hello.c
 #
 # Output defaults to the source path with .borgmodule instead of .c. Copy it
-# to userfs/Programs/borg_modules/ on the instrument.
+# directly to userfs/Programs/ on the instrument; no subdirectory is scanned.
 
 set -e
 

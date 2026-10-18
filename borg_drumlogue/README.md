@@ -91,16 +91,16 @@ exclusive data and running status are passed through unchanged.
 
 ### Modules
 
-A `.borgmodule` adds a page to the menu. It is an ordinary shared object kept
-in the instrument's userfs at `userfs/Programs/borg_modules/`, built against
+A `.borgmodule` adds a menu page. It is an ARM shared object kept directly in
+`userfs/Programs/`. No subdirectory is scanned. Build it against
 `emulator/shim/borg_module.h`.
 
-Modules are loaded once, on the first panel read or write after the switch. A
-file whose entry point or ABI does not match is written to
-`userfs/Programs/borg-modules.log` and skipped; the rest still load. A module
-that loads is never unloaded while the daemon runs. A module copied into the
-directory after that point is picked up on the next switch, not by reopening
-the menu.
+Modules load on the first panel action after the switch. The directory is
+checked again each time the menu opens, so a module copied while the daemon
+runs appears after the menu is closed and reopened.
+
+A file that fails to load is written to `userfs/Programs/borg-modules.log` and
+skipped. A loaded module is never unloaded.
 
 ABI 1 offers one menu page:
 
@@ -116,7 +116,9 @@ The host reads `abi` first and never reads past the layout that ABI names.
 Fields are only appended, never reordered or removed. `init` receives the host
 services (log, module path, text, dark text, row) and the module's own path. A
 module may draw its page but not clear the screen, and it may not create a
-process or a thread.
+process or a thread. `row` has a 12-character label column and a 12-character
+value column; use `text` for longer lines. The panel stops drawing a text run
+at a comma, so use a space instead.
 
 Build the example:
 
@@ -124,10 +126,10 @@ Build the example:
 ./build-module.sh modules/hello/hello.c
 ```
 
-That writes `modules/hello/hello.borgmodule`. Copy it to
-`userfs/Programs/borg_modules/` on the instrument before selecting the unit.
-Its `HELLO` tab sits after the built-in tabs; PAGE DOWN reaches it, and the page
-shows `MODULE:` and `Hello, module!`.
+That writes `modules/hello/hello.borgmodule`. Copy it directly to
+`userfs/Programs/` on the instrument before selecting the unit. Its `HELLO` tab
+sits after the built-in tabs; PAGE DOWN reaches it, and the page shows
+`MODULE:` and `HELLO MODULE`.
 
 `LOGUE_BORG_MODULE_DIR` overrides the module directory, which is useful for a
 test tree.
