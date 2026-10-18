@@ -74,6 +74,7 @@ static int midi_transpose;
 static int midi_velocity = 100;
 
 static unsigned long audio_calls, audio_errors;
+static unsigned long menu_opens;
 
 static time_t start_epoch;
 
@@ -150,6 +151,7 @@ static void panel_del(int fd) {
 
 /* One class-0x85 id 0 frame: box header, then the text (at most 51 chars). */
 static size_t screen_frame(unsigned char* out, unsigned char role,
+                           unsigned char fg, unsigned char bg,
                            unsigned x, unsigned y, unsigned w, unsigned h,
                            const char* text) {
   size_t n = strlen(text);
@@ -158,8 +160,8 @@ static size_t screen_frame(unsigned char* out, unsigned char role,
   out[1] = (unsigned char)(13 + n);
   out[2] = 0x00;
   out[3] = role;
-  out[4] = 0x0f;
-  out[5] = 0x00;
+  out[4] = fg;
+  out[5] = bg;
   out[6] = (unsigned char)(x & 0x7f);
   out[7] = (unsigned char)((x >> 7) & 0x7f);
   out[8] = (unsigned char)y;
@@ -171,13 +173,14 @@ static size_t screen_frame(unsigned char* out, unsigned char role,
   return 13 + n;
 }
 
-/* One class-0x85 id 1 frame: a region fill. */
-static size_t fill_frame(unsigned char* out, unsigned x, unsigned y,
-                         unsigned w, unsigned h) {
+/* One class-0x85 id 1 frame: a region fill. Role 0 is the page background;
+ * role 0x0f is the light band the daemon puts behind a field name. */
+static size_t fill_frame(unsigned char* out, unsigned char role,
+                         unsigned x, unsigned y, unsigned w, unsigned h) {
   out[0] = 0x85;
   out[1] = 0x0c;
   out[2] = 0x01;
-  out[3] = 0x00;                              /* role */
+  out[3] = role;
   out[4] = 0x00;                              /* style */
   out[5] = (unsigned char)(x & 0x7f);
   out[6] = (unsigned char)((x >> 7) & 0x7f);
@@ -191,55 +194,97 @@ static size_t fill_frame(unsigned char* out, unsigned x, unsigned y,
 
 /* Role 0 is the daemon's label and title style, the small font. Role 2 is the
  * large value style, which does not fit six rows on a 64-unit screen. */
+static void put_styled(unsigned x, unsigned y, unsigned w, unsigned h,
+                       unsigned char fg, unsigned char bg, const char* text) {
+  unsigned char frame[64];
+  const size_t n = screen_frame(frame, 0x20, fg, bg, x, y, w, h, text);
+  if (panel_out_fd >= 0) raw_write(panel_out_fd, frame, n);
+}
+
 static void put_text(unsigned x, unsigned y, unsigned w, unsigned h,
                      const char* text) {
-  unsigned char frame[64];
-  const size_t n = screen_frame(frame, 0x20, x, y, w, h, text);
-  if (panel_out_fd >= 0) raw_write(panel_out_fd, frame, n);
+  put_styled(x, y, w, h, 0x0f, 0x00, text);
+}
+
+static void put_label(unsigned x, unsigned y, unsigned w, unsigned h,
+                      const char* text) {
+  put_styled(x, y, w, h, 0x00, 0x0f, text);
+}
+
+/* A field name on the left and its value right-aligned on the right. The
+ * name sits on the light band the daemon uses for field names; the value is
+ * drawn from its right edge, so a column of numbers lines up. */
+static void menu_row(unsigned y, const char* label, const char* value) {
+  unsigned char fill[12];
+  char cell[16];
+
+  raw_write(panel_out_fd, fill, fill_frame(fill, 0x0f, 0, y, 120, 8));
+  snprintf(cell, sizeof cell, "%-12s", label);
+  put_label(0, y, 120, 8, cell);
+  snprintf(cell, sizeof cell, "%12s", value);
+  put_text(128, y, 128, 8, cell);
 }
 
 static void menu_draw(void) {
   unsigned char fill[12];
-  char line[64];
+  char value[24];
 
   if (panel_out_fd < 0) return;
 
-  raw_write(panel_out_fd, fill, fill_frame(fill, 0, 0, 256, 64));
+  /* The page starts from black. A one-unit light rule under the tab bar is
+   * the same fill the daemon puts behind a label, so it reads as a divider
+   * rather than as another text row. */
+  raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 0, 256, 64));
+  raw_write(panel_out_fd, fill, fill_frame(fill, 0x0f, 0, 9, 256, 1));
+
+  /* Two tabs, the active one as a light band with dark text. The arrows at
+   * the edges sit where the two page keys act. */
+  raw_write(panel_out_fd, fill,
+            fill_frame(fill, 0x0f, menu_page == 0 ? 10 : 128, 0, 118, 8));
+  put_styled(10, 0, 118, 8,
+             menu_page == 0 ? 0x00 : 0x0f, menu_page == 0 ? 0x0f : 0x00,
+             menu_page == 0 ? " [ STATUS ]" : "   STATUS  ");
+  put_styled(128, 0, 118, 8,
+             menu_page == 1 ? 0x00 : 0x0f, menu_page == 1 ? 0x0f : 0x00,
+             menu_page == 1 ? " [ MIDI ]  " : "    MIDI   ");
+  put_text(0, 0, 10, 8, "<");
+  put_text(246, 0, 10, 8, ">");
 
   if (menu_page == 0) {
-    unsigned char title[64];
-    const size_t n =
-        screen_frame(title, 0x20, 64, 0, 128, 8, "-BORG 1/2-");
-    raw_write(panel_out_fd, title, n);
-
-    snprintf(line, sizeof line, "PID %d", (int)getpid());
-    put_text(0, 11, 256, 8, line);
-    snprintf(line, sizeof line, "UP %ld S", (long)(time(NULL) - start_epoch));
-    put_text(0, 20, 256, 8, line);
-    snprintf(line, sizeof line, "AUDIO %lu CALLS", audio_calls);
-    put_text(0, 29, 256, 8, line);
-    snprintf(line, sizeof line, "XRUNS %lu", audio_errors);
-    put_text(0, 38, 256, 8, line);
-    put_text(0, 47, 256, 8, "CHORD CLOSES");
-    put_text(0, 56, 256, 8, "PAGE KEYS MOVE");
+    const long up = (long)(time(NULL) - start_epoch);
+    snprintf(value, sizeof value, "%d", (int)getpid());
+    menu_row(11, "DAEMON PID:", value);
+    if (up >= 3600) {
+      snprintf(value, sizeof value, "%ldH %02ldM", up / 3600, (up / 60) % 60);
+    } else if (up >= 60) {
+      snprintf(value, sizeof value, "%ldM %02ldS", up / 60, up % 60);
+    } else {
+      snprintf(value, sizeof value, "%ld S", up);
+    }
+    menu_row(20, "UPTIME:", value);
+    snprintf(value, sizeof value, "%lu", audio_calls);
+    menu_row(29, "AUDIO CALLS:", value);
+    snprintf(value, sizeof value, "%lu/S",
+             up > 0 ? audio_calls / (unsigned long)up : 0UL);
+    menu_row(38, "AUDIO RATE:", value);
+    snprintf(value, sizeof value, "%lu", audio_errors);
+    menu_row(47, "AUDIO XRUNS:", value);
+    snprintf(value, sizeof value, "%lu", menu_opens);
+    menu_row(56, "MENU OPENS:", value);
   } else {
-    unsigned char title[64];
-    const size_t n =
-        screen_frame(title, 0x20, 64, 0, 128, 8, "-MIDI 2/2-");
-    raw_write(panel_out_fd, title, n);
-
-    snprintf(line, sizeof line, "IN %lu OUT %lu", midi_in_bytes, midi_out_bytes);
-    put_text(0, 11, 256, 8, line);
-    snprintf(line, sizeof line, "MSGS %lu NOTES %lu", midi_in_msgs, midi_notes);
-    put_text(0, 20, 256, 8, line);
-    snprintf(line, sizeof line, "LAST %02lX %02lX %02lX", midi_last_status,
+    snprintf(value, sizeof value, "%lu B", midi_in_bytes);
+    menu_row(11, "MIDI IN:", value);
+    snprintf(value, sizeof value, "%lu B", midi_out_bytes);
+    menu_row(20, "MIDI OUT:", value);
+    snprintf(value, sizeof value, "%lu / %lu", midi_in_msgs, midi_notes);
+    menu_row(29, "MSGS/NOTES:", value);
+    snprintf(value, sizeof value, "%02lX %02lX %02lX", midi_last_status,
              midi_last_note, midi_last_vel);
-    put_text(0, 29, 256, 8, line);
-    snprintf(line, sizeof line, "TRANSPOSE %d VEL %d%%", midi_transpose,
-             midi_velocity);
-    put_text(0, 38, 256, 8, line);
-    put_text(0, 47, 256, 8, "CHORD CLOSES");
-    put_text(0, 56, 256, 8, "PAGE KEYS MOVE");
+    menu_row(38, "LAST NOTE:", value);
+    snprintf(value, sizeof value, "%+d", midi_transpose);
+    menu_row(47, "TRANSPOSE:", value);
+    snprintf(value, sizeof value, "%d%%", midi_velocity);
+    menu_row(56, "VELOCITY:", value);
   }
 }
 
@@ -247,6 +292,7 @@ static void menu_show(int fd) {
   panel_out_fd = fd;
   menu_open = 1;
   menu_page = 0;
+  menu_opens++;
   menu_draw();
 }
 
@@ -255,7 +301,7 @@ static void menu_hide(int fd) {
   menu_open = 0;
   /* Erase the menu first: the replay below is the daemon's screen as it was,
    * and it does not have to repaint every box the menu used. */
-  raw_write(fd, fill, fill_frame(fill, 0, 0, 256, 64));
+  raw_write(fd, fill, fill_frame(fill, 0x00, 0, 0, 256, 64));
   if (capture_valid && capture_len > 0) {
     raw_write(fd, capture, capture_len);
   }

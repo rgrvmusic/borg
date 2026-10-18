@@ -55,15 +55,18 @@ process.
 Hold MUTE and press MASTER (the sixteenth part key) to open the menu. The same
 chord closes it.
 
-| Page | Shows |
-|---|---|
-| 1 | daemon pid, uptime, audio writes, audio errors |
-| 2 | MIDI bytes in and out, messages and notes, the last note, transpose and velocity settings |
+The menu draws a tab bar across the top, with an arrow at each edge. PAGE UP
+and PAGE DOWN move between the tabs, and the active tab is shown inverted.
 
-PAGE UP and PAGE DOWN move between the pages while the menu is open. The menu
-draws over the daemon's screen, and the daemon's last screen is restored when
-it closes. The opening MASTER press, the page keys and the closing MASTER press
-are held back from the daemon; every other key and the lamps behave as before.
+| Tab | Shows |
+|---|---|
+| STATUS | daemon pid, uptime, audio calls and rate, audio xruns, menu opens |
+| MIDI | MIDI bytes in and out, messages and notes, the last note, transpose and velocity |
+
+The menu draws over the daemon's screen, and the daemon's last screen is
+restored when it closes. Both chord presses are held back, so opening the menu
+cannot arm MUTE or change the daemon's page. A MUTE or MASTER press on its own is
+still delivered, in order; every other key and the lamps behave as before.
 
 ### MIDI note transform
 
