@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Borg</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="top-banner">
+        <div class="banner-title">Borg</div>
+        <a class="banner-link" href="https://github.com/gbraad-logue/borg">GitHub</a>
+    </div>
+    <main>
+        <h1>Borg</h1>
+        <p>A drumlogue unit that switches <code>drumlogued</code> to run extensions in place. Select the unit and fire <code>GateOn()</code>: the daemon re-executes itself under an embedded preload object, same pid, with no rootfs writes. A power cycle restores everything.</p>
+
+        <h2>Extensions</h2>
+        <ul>
+            <li>A status menu, opened with MUTE and MASTER.</li>
+            <li>An optional MIDI note and velocity transform.</li>
+        </ul>
+
+        <h2>Build</h2>
+        <p>Requires podman and a logue-sdk checkout.</p>
+        <pre>LOGUE_SDK_PATH=~/Projects/logue/logue-sdk ./build-drum.sh borg_drumlogue</pre>
+        <p>Output: <code>bin/borg_drumlogue.drmlgunit</code>.</p>
+
+        <h2>Install and use</h2>
+        <ol>
+            <li>Copy <code>borg_drumlogue.drmlgunit</code> to <code>userfs/Units/Synths/</code> on the instrument.</li>
+            <li>Load the unit on a part.</li>
+            <li>Save the program, so the daemon reloads it after the switch.</li>
+            <li>Fire <code>GateOn()</code>.</li>
+        </ol>
+
+        <h2>Documentation</h2>
+        <p>See the <a href="https://github.com/gbraad-logue/borg/blob/main/borg_drumlogue/README.md">unit README</a> for details.</p>
+    </main>
+</body>
+</html>
