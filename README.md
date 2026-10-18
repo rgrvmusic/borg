@@ -32,5 +32,10 @@ Install and use are in [borg_drumlogue/README.md](borg_drumlogue/README.md).
 This repo is self-contained and abstracts away some of the other experiments I have done.
 
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+
 > [!NOTE]
 > "drumlogue" and "microKORG2" are trademarks of KORG Inc. Borg is independent work: it is not affiliated with, endorsed by or supported by KORG. Any damage is your own responsiblity. No reverse engineering or disassembly was used. This relies on public files provided by the logue SDK.
