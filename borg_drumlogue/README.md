@@ -134,6 +134,61 @@ sits after the built-in tabs; PAGE DOWN reaches it, and the page shows
 `LOGUE_BORG_MODULE_DIR` overrides the module directory, which is useful for a
 test tree.
 
+### Unit pages
+
+An ordinary synth unit can add a page of its own while borg is active. The unit
+is loaded into the same process, so it can call the optional API in
+`emulator/shim/borg_unit.h`. The declarations are weak: when borg is not
+active the symbols are zero, the unit does not register anything, and it runs
+exactly as it did before.
+
+Register from `unit_init` or `unit_resume`, and unregister from `unit_teardown`
+or `unit_suspend`. The page is drawn by borg on the panel thread, only while
+the page is selected. The panel reports at 2 Hz, and that is the refresh a unit
+page gets, so the page follows playback while the menu is held open.
+
+The audio callbacks must not draw. Publish a small snapshot with atomics from
+`unit_render`, and read that snapshot in the draw callback:
+
+```c++
+#include <atomic>
+#include <cstdio>
+#include "borg_unit.h"
+
+static std::atomic<int> s_order{0};
+static std::atomic<int> s_row{0};
+static std::atomic<bool> s_playing{false};
+
+static void page_draw(const borg_unit_panel* panel, void*) {
+  char value[16];
+
+  std::snprintf(value, sizeof value, "%02d", s_order.load());
+  panel->row(26, "ORDER:", value);
+  std::snprintf(value, sizeof value, "%02X", s_row.load());
+  panel->row(35, "ROW:", value);
+  panel->row(44, "STATUS:", s_playing.load() ? "PLAY" : "STOP");
+}
+
+static const borg_unit_desc s_desc = {
+  BORG_UNIT_ABI, "TRACK", page_draw, nullptr
+};
+
+// In unit_init, after the unit's own setup:
+if (borg_unit_register != nullptr) borg_unit_register(&s_desc);
+
+// In unit_teardown, before the unit frees its state:
+if (borg_unit_unregister != nullptr) borg_unit_unregister(&s_desc);
+```
+
+The page uses the four rows below the tab bar. `row` gives a 12-character label
+column and a 12-character value column; `text` and `dark` take a box and are
+for longer lines, at most 25 characters across the screen. The panel stops
+drawing a text run at a comma, so use a space instead. The tab title is cut to
+7 characters.
+
+Only one page is offered per registered unit, and up to four units can be
+registered. Unit pages sit after STATUS and MIDI; module pages follow them.
+
 
 ## Logs
 
@@ -141,7 +196,7 @@ test tree.
 |---|---|
 | `userfs/Programs/borg-exec.log` | pre-switch state and any refusal |
 | `userfs/Programs/borg-shim.log` | attach confirmation from the loaded object |
-| `userfs/Programs/borg-modules.log` | module load and skip lines |
+| `userfs/Programs/borg-modules.log` | module load and skip lines, and unit page registrations |
 | `/tmp/logue-borg-unit.log` | unit-side errors |
 | `/tmp/logue-borg-midi.log` | transformed MIDI notes |
 

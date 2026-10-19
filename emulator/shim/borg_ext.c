@@ -30,6 +30,8 @@
 #include <unistd.h>
 
 #include "borg_module.h"
+#define BORG_UNIT_BUILD 1
+#include "borg_unit.h"
 
 #ifndef LOGUE_BORG_MIDI_LOG
 #define LOGUE_BORG_MIDI_LOG "/tmp/logue-borg-midi.log"
@@ -52,7 +54,9 @@
 #define MODULE_FILE_MAX 96
 #define MODULE_DIR_MAX 256
 #define MODULE_PATH_MAX 512
-#define MODULE_PAGE_BASE 2
+/* STATUS and MIDI come first; unit pages follow, then module pages. */
+#define UNIT_PAGE_BASE 2
+#define UNIT_MAX 4
 
 /* The daemon's own key indices, measured from the panel. */
 #define KEY_MASTER 0x0f
@@ -335,6 +339,113 @@ static const borg_host host_services = {
   host_log, host_path, host_text, host_dark, host_row
 };
 
+/* ------------------------------------------------------------ the unit pages
+ *
+ * A unit is loaded into this same process, so it can see this object's
+ * symbols. The declarations in borg_unit.h are weak: a unit built against
+ * them runs unchanged when borg is not active, because the symbol resolves to
+ * zero. A unit that does find us registers a page and a draw callback.
+ *
+ * Registration happens from unit_init or unit_resume, off the audio thread.
+ * The set is published as an immutable array and the old one is left alone:
+ * the panel thread may still be walking it, and a registration is rare enough
+ * that a few dozen bytes are cheaper than a lock on the panel path. */
+
+typedef struct unit_set {
+  int n;
+  const borg_unit_desc* desc[UNIT_MAX];
+} unit_set;
+
+static unit_set* unit_set_live;
+
+static unit_set* unit_set_copy(void) {
+  const unit_set* cur = __atomic_load_n(&unit_set_live, __ATOMIC_ACQUIRE);
+  unit_set* next = (unit_set*)malloc(sizeof *next);
+
+  if (next == NULL) return NULL;
+  if (cur != NULL) {
+    *next = *cur;
+  } else {
+    next->n = 0;
+  }
+  return next;
+}
+
+int borg_unit_register(const borg_unit_desc* desc) {
+  unit_set* next;
+  int i;
+
+  if (desc == NULL || desc->abi != BORG_UNIT_ABI || desc->name == NULL ||
+      desc->name[0] == '\0' || desc->draw == NULL) {
+    return -1;
+  }
+  next = unit_set_copy();
+  if (next == NULL) return -1;
+  for (i = 0; i < next->n; i++) {
+    if (next->desc[i] == desc) {
+      __atomic_store_n(&unit_set_live, next, __ATOMIC_RELEASE);
+      return 0;
+    }
+  }
+  if (next->n >= UNIT_MAX) {
+    free(next);
+    return -1;
+  }
+  next->desc[next->n++] = desc;
+  __atomic_store_n(&unit_set_live, next, __ATOMIC_RELEASE);
+  module_logf("unit page %s", desc->name);
+  return 0;
+}
+
+void borg_unit_unregister(const borg_unit_desc* desc) {
+  unit_set* next;
+  int i, j;
+  int found = 0;
+
+  if (desc == NULL) return;
+  next = unit_set_copy();
+  if (next == NULL) return;
+  for (i = 0; i < next->n; i++) {
+    if (next->desc[i] == desc) {
+      for (j = i + 1; j < next->n; j++) next->desc[j - 1] = next->desc[j];
+      next->n--;
+      found = 1;
+      break;
+    }
+  }
+  if (!found) {
+    free(next);
+    return;
+  }
+  if (next->n == 0) {
+    /* The empty set was never published, so it can be freed. The old set is
+     * still reachable by a reader and stays allocated. */
+    __atomic_store_n(&unit_set_live, NULL, __ATOMIC_RELEASE);
+    free(next);
+    return;
+  }
+  __atomic_store_n(&unit_set_live, next, __ATOMIC_RELEASE);
+}
+
+static int unit_count(void) {
+  const unit_set* set = __atomic_load_n(&unit_set_live, __ATOMIC_ACQUIRE);
+
+  return set != NULL ? set->n : 0;
+}
+
+static const borg_unit_desc* page_unit(int page) {
+  const unit_set* set = __atomic_load_n(&unit_set_live, __ATOMIC_ACQUIRE);
+  const int i = page - UNIT_PAGE_BASE;
+
+  if (set == NULL || i < 0 || i >= set->n) return NULL;
+  return set->desc[i];
+}
+
+static const borg_unit_panel unit_panel_services = {
+  (uint32_t)sizeof(borg_unit_panel), BORG_UNIT_ABI,
+  host_text, host_dark, host_row
+};
+
 static int module_suffix(const char* name) {
   static const char ext[] = ".borgmodule";
   const size_t n = strlen(name);
@@ -503,24 +614,29 @@ static void modules_rescan(void) {
   __atomic_store_n(&module_rescan_busy, 0, __ATOMIC_RELEASE);
 }
 
+static int module_page_base(void) {
+  return UNIT_PAGE_BASE + unit_count();
+}
+
 static int page_count(void) {
   const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
 
-  return MODULE_PAGE_BASE + (set != NULL ? set->n_pages : 0);
+  return module_page_base() + (set != NULL ? set->n_pages : 0);
 }
 
 static const borg_module* page_module(int page) {
   const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  const int base = module_page_base();
   int i, seen = 0;
 
-  if (set == NULL || page < MODULE_PAGE_BASE) return NULL;
+  if (set == NULL || page < base) return NULL;
   for (i = 0; i < set->n_modules; i++) {
     const borg_module* m = set->mod[i];
     if ((m->capabilities & BORG_CAP_PAGE) == 0 || m->page_draw == NULL ||
         m->name == NULL) {
       continue;
     }
-    if (seen == page - MODULE_PAGE_BASE) return m;
+    if (seen == page - base) return m;
     seen++;
   }
   return NULL;
@@ -529,9 +645,12 @@ static const borg_module* page_module(int page) {
 static void menu_draw(void) {
   unsigned char fill[12];
   char value[24];
-  char tab[BORG_TAB_MAX];
+  char tab[BORG_UNIT_TAB_MAX];
+  const int pages = page_count();
 
   if (panel_out_fd < 0) return;
+  /* A unit can suspend while its page is open, which takes the page with it. */
+  if (pages > 0 && menu_page >= pages) menu_page = pages - 1;
 
   /* The daemon's page preamble: the whole screen, then the title band, both
    * role 0. */
@@ -566,16 +685,35 @@ static void menu_draw(void) {
   } else {
     put_text(64, 14, 64, 8, "MIDI");
   }
-  /* The third cell carries the first module's tab, or the active module's tab
-   * while one of their pages is open. It is the same 64-wide cell as STATUS,
-   * MIDI, BANK and TARGET. A name is cut to the cell's 7 characters. */
+  /* The third cell carries the first unit's tab, else the first module's; on a
+   * unit or module page it carries that page's tab. It is the same 64-wide cell
+   * as STATUS, MIDI, BANK and TARGET. A name is cut to the cell's 7 characters. */
   {
-    const borg_module* tab_module =
-        menu_page >= MODULE_PAGE_BASE ? page_module(menu_page)
-                                      : page_module(MODULE_PAGE_BASE);
-    if (tab_module != NULL) {
+    const int module_base = module_page_base();
+    const borg_unit_desc* tab_unit = NULL;
+    const borg_module* tab_module = NULL;
+    int tab_active = 0;
+
+    if (menu_page >= UNIT_PAGE_BASE && menu_page < module_base) {
+      tab_unit = page_unit(menu_page);
+      tab_active = 1;
+    } else if (menu_page >= module_base) {
+      tab_module = page_module(menu_page);
+      tab_active = 1;
+    } else {
+      tab_unit = page_unit(UNIT_PAGE_BASE);
+      if (tab_unit == NULL) tab_module = page_module(module_base);
+    }
+    if (tab_unit != NULL) {
+      snprintf(tab, sizeof tab, "%s", tab_unit->name);
+      if (tab_active) {
+        put_dark(128, 12, 64, 8, tab);
+      } else {
+        put_text(128, 14, 64, 8, tab);
+      }
+    } else if (tab_module != NULL) {
       snprintf(tab, sizeof tab, "%s", tab_module->name);
-      if (menu_page >= MODULE_PAGE_BASE) {
+      if (tab_active) {
         put_dark(128, 12, 64, 8, tab);
       } else {
         put_text(128, 14, 64, 8, tab);
@@ -609,10 +747,28 @@ static void menu_draw(void) {
     menu_row(44, "LAST NOTE:", value);
     snprintf(value, sizeof value, "%+d / %d%%", midi_transpose, midi_velocity);
     menu_row(53, "TRANS/VEL:", value);
+  } else if (menu_page < module_page_base()) {
+    const borg_unit_desc* u = page_unit(menu_page);
+    if (u != NULL && u->draw != NULL) u->draw(&unit_panel_services, u->user);
   } else {
     const borg_module* m = page_module(menu_page);
     if (m != NULL && m->page_draw != NULL) m->page_draw();
   }
+}
+
+/* Redraw only the unit's content area, leaving the title and tab bar alone.
+ * Called from the panel thread on the panel's own half-second report, so a
+ * unit's page follows playback while the menu is held open. */
+static void unit_page_redraw(void) {
+  unsigned char fill[12];
+  const borg_unit_desc* u;
+
+  if (panel_out_fd < 0 || !menu_open) return;
+  if (menu_page < UNIT_PAGE_BASE || menu_page >= module_page_base()) return;
+  u = page_unit(menu_page);
+  if (u == NULL || u->draw == NULL) return;
+  raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 24, 256, 40));
+  u->draw(&unit_panel_services, u->user);
 }
 
 static void menu_show(int fd) {
@@ -843,6 +999,10 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
     }
   }
   while (in < got) out[o++] = buf[in++];
+
+  /* The panel reports at 2 Hz even when no key moves. That is the tick a unit
+   * page uses to follow playback; it runs on the panel thread. */
+  if (menu_open) unit_page_redraw();
 
   if (o <= cap) {
     memcpy(buf, out, o);
