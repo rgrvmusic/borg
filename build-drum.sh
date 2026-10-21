@@ -10,7 +10,7 @@ PLATFORM_PATH="$LOGUE_SDK_PATH/platform"
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-docker.io/xiashj/logue-sdk:latest}"
 
 SHARED_PATH="${SHARED_PATH:-$SCRIPT_DIR/shared}"
-SHIM_PATH="${SHIM_PATH:-$SCRIPT_DIR/emulator/shim}"
+LIBBORG_PATH="${LIBBORG_PATH:-$SCRIPT_DIR/libborg}"
 
 EXTRA_MK_HOST=""
 EXTRA_MOUNTS=()
@@ -68,13 +68,13 @@ build_unit() {
     rm -rf "$unit/build" "$unit/.dep" 2>/dev/null || true
     rm -f "$unit"/*.drmlgunit 2>/dev/null || true
 
-    # Build the embedded shim before borg_blob.S includes it.
+    # Build the resident object before borg_blob.S includes it.
     if [ "$unit" = borg_drumlogue ]; then
         echo "Building the resident object for $unit..."
         podman run --rm \
             -v "$PLATFORM_PATH:/workspace:rw" \
             -v "$SCRIPT_DIR/$unit:/workspace/drumlogue/$unit:rw" \
-            -v "$SHIM_PATH:/nthost/shim:ro" \
+            -v "$LIBBORG_PATH:/nthost/libborg:ro" \
             -h logue-sdk \
             "$CONTAINER_IMAGE" \
             /app/cmd_entry bash -c "
@@ -82,8 +82,8 @@ build_unit() {
                 source /app/drumlogue/environment
                 cd /workspace/drumlogue/$unit
                 \${CROSS_COMPILE}gcc -shared -fPIC -O2 -Wall -Wextra \
-                    -o libborg.so /nthost/shim/borg_shim.c \
-                    /nthost/shim/borg_ext.c -ldl
+                    -o libborg.so /nthost/libborg/borg_shim.c \
+                    /nthost/libborg/borg_ext.c -ldl
             "
     fi
 

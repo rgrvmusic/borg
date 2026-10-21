@@ -81,17 +81,18 @@ the daemon is not reading, which is a wiring question rather than a command one.
 ## Host tool
 
 ```sh
-tools/rgexec.py ping
-tools/rgexec.py run info
-tools/rgexec.py run storage all
-tools/rgexec.py run 'uname -a'
-tools/rgexec.py -p hw:3,0 run info
+tools/borgexec.py ping
+tools/borgexec.py run info
+tools/borgexec.py run storage all
+tools/borgexec.py run 'uname -a'
+tools/borgexec.py -p hw:3,0 run info
 ```
 
 `run` adds `@exec` if it is missing, decodes the escaped reply, and prints the
-exit status. The default port is the first rawmidi node of the drumlogue's
-gadget card (USB vendor `0944`); `-p` takes a node path or `hw:card,device`. The
-gadget presents two nodes, so if a request reaches nothing, name the other one.
+exit status. The default port is the drumlogue's gadget card when it is plugged
+in, otherwise the only USB MIDI interface present, whatever its make; `-p` takes
+a node path or `hw:card,device`. The gadget presents two nodes, so if a request
+reaches nothing, name the other one.
 
 `ping` sends the bare `@exec`, which is answered in place. It is the fastest way
 to tell a closed channel from a refused command.
