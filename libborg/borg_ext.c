@@ -826,19 +826,32 @@ static void menu_draw(void) {
   }
 }
 
-/* Redraw only the unit's content area, leaving the title and tab bar alone.
+/* Redraw only the page's content area, leaving the title and tab bar alone.
  * Called from the panel thread on the panel's own half-second report, so a
- * unit's page follows playback while the menu is held open. */
-static void unit_page_redraw(void) {
+ * unit's or a module's page follows playback while the menu is held open. A
+ * module that is busy with a MIDI callback is left alone for this report: the
+ * clear must not happen before the draw is known to be possible. */
+static void page_redraw(void) {
   unsigned char fill[12];
-  const borg_unit_desc* u;
+  const int module_base = module_page_base();
 
   if (panel_out_fd < 0 || !menu_open) return;
-  if (menu_page < UNIT_PAGE_BASE || menu_page >= module_page_base()) return;
-  u = page_unit(menu_page);
-  if (u == NULL || u->draw == NULL) return;
-  raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 24, 256, 40));
-  u->draw(&unit_panel_services, u->user);
+  if (menu_page < UNIT_PAGE_BASE) return;
+  if (menu_page >= module_base) {
+    const borg_module* m = page_module(menu_page);
+    if (m == NULL || m->page_draw == NULL) return;
+    if (pthread_mutex_trylock(&module_call_lock) != 0) return;
+    raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 24, 256, 40));
+    m->page_draw();
+    pthread_mutex_unlock(&module_call_lock);
+    return;
+  }
+  {
+    const borg_unit_desc* u = page_unit(menu_page);
+    if (u == NULL || u->draw == NULL) return;
+    raw_write(panel_out_fd, fill, fill_frame(fill, 0x00, 0, 24, 256, 40));
+    u->draw(&unit_panel_services, u->user);
+  }
 }
 
 static void menu_show(int fd) {
@@ -1070,11 +1083,12 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
   }
   while (in < got) out[o++] = buf[in++];
 
-  /* The panel reports at 2 Hz even when no key moves. That is the tick a unit
-   * page uses to follow playback, and the one a module gets for work that is
-   * not driven by a read. It runs on the panel thread. */
-  if (menu_open) unit_page_redraw();
+  /* The panel reports at 2 Hz even when no key moves. The tick does a module's
+   * waiting work first, so the page drawn below is the state after it, and the
+   * page redraw keeps a unit or module page following playback. Both run on the
+   * panel thread. */
   modules_tick();
+  if (menu_open) page_redraw();
 
   if (o <= cap) {
     memcpy(buf, out, o);

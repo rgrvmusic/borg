@@ -94,7 +94,7 @@ exclusive data and running status are passed through unchanged.
 A `.borgmodule` adds a menu page, and may answer MIDI that arrives on any port
 the daemon reads. It is an ARM shared object kept directly in
 `userfs/Programs/`. No subdirectory is scanned. Build it against
-`emulator/shim/borg_module.h`; C and C++ sources both work.
+`libborg/borg_module.h`; C and C++ sources both work.
 
 Modules load on the first panel action after the switch. The directory is
 checked again each time the menu opens, so a module copied while the daemon
@@ -163,7 +163,7 @@ Copy `modules/exec/exec.borgmodule`, or the copy in `bin/`, to
 `userfs/Programs/` the same way. It
 answers `@exec <command>` on every port the daemon reads, uses the kernel's
 usermode helper for commands, and is driven from a computer with
-`tools/rgexec.py`. See [modules/exec/README.md](../modules/exec/README.md).
+`tools/borgexec.py`. See [modules/exec/README.md](../modules/exec/README.md).
 
 `LOGUE_BORG_MODULE_DIR` overrides the module directory, which is useful for a
 test tree.
@@ -172,14 +172,14 @@ test tree.
 
 An ordinary synth unit can add a page of its own while borg is active. The unit
 is loaded into the same process, so it can call the optional API in
-`emulator/shim/borg_unit.h`. The declarations are weak: when borg is not
+`libborg/borg_unit.h`. The declarations are weak: when borg is not
 active the symbols are zero, the unit does not register anything, and it runs
 exactly as it did before.
 
 Register from `unit_init` or `unit_resume`, and unregister from `unit_teardown`
 or `unit_suspend`. The page is drawn by borg on the panel thread, only while
 the page is selected. The panel reports at 2 Hz, and that is the refresh a unit
-page gets, so the page follows playback while the menu is held open.
+or module page gets, so the page follows playback while the menu is held open.
 
 The audio callbacks must not draw. Publish a small snapshot with atomics from
 `unit_render`, and read that snapshot in the draw callback:

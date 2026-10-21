@@ -33,7 +33,7 @@ kernel's usermode helper, and has a host tool:
 
 ```sh
 ./build-module.sh modules/exec/exec.cc
-tools/rgexec.py run 'uname -a'
+tools/borgexec.py run 'uname -a'
 ```
 
 See [modules/exec/README.md](modules/exec/README.md).

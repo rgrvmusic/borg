@@ -53,13 +53,13 @@ podman run --rm \
             *.cc|*.cpp|*.cxx)
                 \${CROSS_COMPILE}g++ -std=c++14 -fno-exceptions -fno-rtti \
                     -fno-threadsafe-statics -fPIC -O2 -Wall -Wextra \
-                    -I$SCRIPT_DIR/emulator/shim -c -o /out/module.o '$SRC'
+                    -I$SCRIPT_DIR/libborg -c -o /out/module.o '$SRC'
                 \${CROSS_COMPILE}gcc -shared -o /out/module.borgmodule \
                     /out/module.o
                 ;;
             *)
                 \${CROSS_COMPILE}gcc -shared -fPIC -O2 -Wall -Wextra \
-                    -I$SCRIPT_DIR/emulator/shim -o /out/module.borgmodule \
+                    -I$SCRIPT_DIR/libborg -o /out/module.borgmodule \
                     '$SRC'
                 ;;
         esac

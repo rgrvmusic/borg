@@ -35,7 +35,7 @@ DEFS=(
 )
 
 "${CXX:-g++}" -std=c++14 -O1 -g -Wall -Wextra \
-    -I"$ROOT/emulator/shim" \
+    -I"$ROOT/libborg" \
     "${DEFS[@]}" \
     -o "$SCRATCH/native_test" \
     "$HERE/native_test.cc" "$HERE/../exec.cc"
