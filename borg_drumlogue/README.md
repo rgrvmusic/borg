@@ -128,6 +128,22 @@ the host's buffer is cut short and still ends in `F7`, so a reader refuses it fo
 its length instead of waiting for an end that is not coming. `midi_write` may
 wait briefly for room in the output and returns 0 only when every byte went out.
 
+ABI 3 appends panel input for the module's own page. A module that asks for
+`BORG_CAP_INPUT` is told when its page becomes active, and is handed the buttons
+and the four endless encoders while it is shown:
+
+| Field | Meaning |
+|---|---|
+| `page_enter()` | this page became the active menu page |
+| `page_leave()` | it stopped being the active page |
+| `key(index, down)` | a panel button, with the daemon's own index |
+| `encoder(index, delta)` | one of the four knobs under the display, in signed steps |
+
+PAGE UP, PAGE DOWN and the MUTE/MASTER chord stay with the menu, so a page
+cannot trap the user. While a page asks for input it takes every encoder; the
+daemon's page underneath does not see them. The callbacks run on the panel
+thread.
+
 The callbacks are serialized by the host, so a module needs no lock of its own.
 It still must not create a process or a thread, and it must stay silent about
 messages that are not its own: it is offered the traffic of every other device
@@ -164,6 +180,17 @@ Copy `modules/exec/exec.borgmodule`, or the copy in `bin/`, to
 answers `@exec <command>` on every port the daemon reads, uses the kernel's
 usermode helper for commands, and is driven from a computer with
 `tools/borgexec.py`. See [modules/exec/README.md](../modules/exec/README.md).
+
+The storage module is the ABI 3 example and the one that uses the panel:
+
+```sh
+./build-module.sh modules/storage/storage.cc
+```
+
+It mounts a USB stick, lists the sessions under `borg/sessions/` on it, and
+switches the daemon to the chosen session's `userfs` in place. Nothing is
+written to the instrument, and a power cycle returns the daemon to the internal
+userfs. See [modules/storage/README.md](../modules/storage/README.md).
 
 `LOGUE_BORG_MODULE_DIR` overrides the module directory, which is useful for a
 test tree.

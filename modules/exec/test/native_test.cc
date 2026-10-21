@@ -519,8 +519,8 @@ void TestArming(const borg_module* m) {
   Send(m, &g_port_a_tag, "@exec echo hello");
   Check(ExitStatus(g_out_a) == -1, "an armed command has not finished when it "
                                    "is answered");
-  Check(Contains(Notices(g_out_a), "!exec: armed"),
-        "arming says where the answer will be");
+  Check(Contains(Notices(g_out_a), "!armed: running through"),
+        "arming says how the answer will arrive");
 
   const std::string run_dir = std::string(g_scratch) + "/run";
   const std::string script = ScriptIn(run_dir.c_str());
