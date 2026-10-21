@@ -91,9 +91,10 @@ exclusive data and running status are passed through unchanged.
 
 ### Modules
 
-A `.borgmodule` adds a menu page. It is an ARM shared object kept directly in
+A `.borgmodule` adds a menu page, and may answer MIDI that arrives on any port
+the daemon reads. It is an ARM shared object kept directly in
 `userfs/Programs/`. No subdirectory is scanned. Build it against
-`emulator/shim/borg_module.h`.
+`emulator/shim/borg_module.h`; C and C++ sources both work.
 
 Modules load on the first panel action after the switch. The directory is
 checked again each time the menu opens, so a module copied while the daemon
@@ -112,13 +113,33 @@ ABI 1 offers one menu page:
 | `init` | called once, off the audio path |
 | `page_draw` | called on the panel thread while the page is active |
 
+ABI 2 appends MIDI. A module that asks for `BORG_CAP_MIDI` is offered every
+complete SysEx message from every input the daemon reads:
+
+| Field | Meaning |
+|---|---|
+| `midi_in(port, data, n)` | one message, `F0` through `F7` inclusive; `port` is opaque |
+| `tick()` | a cheap pulse, from the panel tick and from a MIDI read |
+| host `midi_write(port, data, n)` | write on the output paired with the input the message arrived on |
+| host `port_name(port)` | the name the daemon opened that input with |
+
+Realtime bytes inside a message are dropped by the host. A message longer than
+the host's buffer is cut short and still ends in `F7`, so a reader refuses it for
+its length instead of waiting for an end that is not coming. `midi_write` may
+wait briefly for room in the output and returns 0 only when every byte went out.
+
+The callbacks are serialized by the host, so a module needs no lock of its own.
+It still must not create a process or a thread, and it must stay silent about
+messages that are not its own: it is offered the traffic of every other device
+on every port.
+
 The host reads `abi` first and never reads past the layout that ABI names.
 Fields are only appended, never reordered or removed. `init` receives the host
-services (log, module path, text, dark text, row) and the module's own path. A
-module may draw its page but not clear the screen, and it may not create a
-process or a thread. `row` has a 12-character label column and a 12-character
-value column; use `text` for longer lines. The panel stops drawing a text run
-at a comma, so use a space instead.
+services (log, module path, text, dark text, row, and in ABI 2 the two MIDI
+calls) and the module's own path. A module may draw its page but not clear the
+screen. `row` has a 12-character label column and a 12-character value column;
+use `text` for longer lines. The panel stops drawing a text run at a comma, so
+use a space instead.
 
 Build the example:
 
@@ -126,10 +147,23 @@ Build the example:
 ./build-module.sh modules/hello/hello.c
 ```
 
-That writes `modules/hello/hello.borgmodule`. Copy it directly to
-`userfs/Programs/` on the instrument before selecting the unit. Its `HELLO` tab
+That writes `modules/hello/hello.borgmodule` and copies it to
+`bin/hello.borgmodule`. Copy either one directly to `userfs/Programs/` on the
+instrument before selecting the unit. Its `HELLO` tab
 sits after the built-in tabs; PAGE DOWN reaches it, and the page shows
 `MODULE:` and `HELLO MODULE`.
+
+The exec module is the ABI 2 example and the operational one:
+
+```sh
+./build-module.sh modules/exec/exec.cc
+```
+
+Copy `modules/exec/exec.borgmodule`, or the copy in `bin/`, to
+`userfs/Programs/` the same way. It
+answers `@exec <command>` on every port the daemon reads, uses the kernel's
+usermode helper for commands, and is driven from a computer with
+`tools/rgexec.py`. See [modules/exec/README.md](../modules/exec/README.md).
 
 `LOGUE_BORG_MODULE_DIR` overrides the module directory, which is useful for a
 test tree.

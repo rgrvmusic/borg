@@ -2,9 +2,14 @@
 # Build a .borgmodule with the logue SDK cross compiler.
 #
 #   ./build-module.sh modules/hello/hello.c
+#   ./build-module.sh modules/exec/exec.cc
 #
-# Output defaults to the source path with .borgmodule instead of .c. Copy it
-# directly to userfs/Programs/ on the instrument; no subdirectory is scanned.
+# Output defaults to the source path with .borgmodule instead of its extension,
+# and a copy is placed in bin/ next to the unit. Copy either one directly to
+# userfs/Programs/ on the instrument; no subdirectory is scanned. A C++ source is
+# linked with the C compiler so the module carries no dependency on the
+# instrument's libstdc++; nothing here may use exceptions or RTTI, and a module
+# that did would not link against this anyway.
 
 set -e
 
@@ -14,7 +19,7 @@ LOGUE_SDK_PATH="${LOGUE_SDK_PATH:-$HOME/Projects/logue/logue-sdk}"
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-docker.io/xiashj/logue-sdk:latest}"
 
 SRC="${1:-$SCRIPT_DIR/modules/hello/hello.c}"
-OUT="${2:-${SRC%.c}.borgmodule}"
+OUT="${2:-${SRC%.*}.borgmodule}"
 
 case "$SRC" in /*) ;; *) SRC="$SCRIPT_DIR/$SRC" ;; esac
 case "$OUT" in /*) ;; *) OUT="$SCRIPT_DIR/$OUT" ;; esac
@@ -44,8 +49,20 @@ podman run --rm \
     /app/cmd_entry bash -c "
         set -e
         source /app/drumlogue/environment
-        \${CROSS_COMPILE}gcc -shared -fPIC -O2 -Wall -Wextra \
-            -I$SCRIPT_DIR/emulator/shim -o /out/module.borgmodule $SRC
+        case '$SRC' in
+            *.cc|*.cpp|*.cxx)
+                \${CROSS_COMPILE}g++ -std=c++14 -fno-exceptions -fno-rtti \
+                    -fno-threadsafe-statics -fPIC -O2 -Wall -Wextra \
+                    -I$SCRIPT_DIR/emulator/shim -c -o /out/module.o '$SRC'
+                \${CROSS_COMPILE}gcc -shared -o /out/module.borgmodule \
+                    /out/module.o
+                ;;
+            *)
+                \${CROSS_COMPILE}gcc -shared -fPIC -O2 -Wall -Wextra \
+                    -I$SCRIPT_DIR/emulator/shim -o /out/module.borgmodule \
+                    '$SRC'
+                ;;
+        esac
     "
 
 # The container writes as a mapped user; copy so the artifact is owned here.
@@ -53,4 +70,15 @@ rm -f "$OUT"
 cp "$BUILD_DIR/module.borgmodule" "$OUT"
 chmod 0644 "$OUT"
 
-echo "built $OUT"
+# bin/ collects the unit and the modules built beside it. Skip the copy when
+# the output was asked for there already.
+BIN_DIR="$SCRIPT_DIR/bin"
+mkdir -p "$BIN_DIR"
+DEST="$BIN_DIR/$(basename "$OUT")"
+if [ "$OUT" != "$DEST" ]; then
+    cp "$OUT" "$DEST"
+    chmod 0644 "$DEST"
+    echo "built $OUT -> $DEST"
+else
+    echo "built $OUT"
+fi

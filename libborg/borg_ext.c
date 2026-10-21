@@ -19,6 +19,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -54,6 +55,11 @@
 #define MODULE_FILE_MAX 96
 #define MODULE_DIR_MAX 256
 #define MODULE_PATH_MAX 512
+#define MIDI_PORT_MAX 8
+/* A command is at most 200 bytes plus a four-byte frame. The buffer is larger
+ * so that an over-long message is cut where a reader can see it is over-long,
+ * and the terminator is still put back on the end. */
+#define MIDI_SYSEX_MAX 512
 /* STATUS and MIDI come first; unit pages follow, then module pages. */
 #define UNIT_PAGE_BASE 2
 #define UNIT_MAX 4
@@ -334,9 +340,14 @@ static void host_row(unsigned y, const char* label, const char* value) {
                                   value != NULL ? value : "");
 }
 
+/* Defined with the MIDI hooks below; the host table is built here. */
+static int host_midi_write(void* port, const void* data, size_t n);
+static const char* host_port_name(void* port);
+
 static const borg_host host_services = {
   (uint32_t)sizeof(borg_host), BORG_MODULE_ABI,
-  host_log, host_path, host_text, host_dark, host_row
+  host_log, host_path, host_text, host_dark, host_row,
+  host_midi_write, host_port_name
 };
 
 /* ------------------------------------------------------------ the unit pages
@@ -504,8 +515,12 @@ static void module_load_file(module_set* set, const char* dir,
     return;
   }
   m = entry(BORG_MODULE_ABI);
-  if (m == NULL || m->abi != BORG_MODULE_ABI) {
-    module_logf("%s: ABI %u not %u", path,
+  /* An ABI 1 module was built against the older entry and may refuse the new
+   * number before returning its table. It is still a page and nothing else, so
+   * it is offered the number it knows. */
+  if (m == NULL) m = entry(1);
+  if (m == NULL || m->abi < 1 || m->abi > BORG_MODULE_ABI) {
+    module_logf("%s: ABI %u not 1..%u", path,
                 (unsigned)(m != NULL ? m->abi : 0u), BORG_MODULE_ABI);
     return;
   }
@@ -521,8 +536,11 @@ static void module_load_file(module_set* set, const char* dir,
       m->name != NULL) {
     set->n_pages++;
   }
-  module_logf("loaded %s %s", m->name != NULL ? m->name : "?",
-              m->version != NULL ? m->version : "");
+  module_logf("loaded %s %s%s", m->name != NULL ? m->name : "?",
+              m->version != NULL ? m->version : "",
+              (m->abi >= 2 && (m->capabilities & BORG_CAP_MIDI) != 0)
+                  ? " (MIDI)"
+                  : "");
 }
 
 static void module_scan_dir(module_set* set, const char* dir) {
@@ -642,6 +660,59 @@ static const borg_module* page_module(int page) {
   return NULL;
 }
 
+/* ------------------------------------------------------------ module calls
+ *
+ * One module call at a time. A MIDI input thread, the panel tick and the page
+ * draw can otherwise be inside the same module together -- the first two on
+ * different MIDI ports, the last on the panel thread -- and a module is a
+ * small object with no thread story of its own. The MIDI path waits its turn,
+ * because a command has to be answered in order. A tick and a page draw do
+ * not wait: they are pulses, and a skipped pulse is one the next half second
+ * supplies. Nothing here is held across a read or a write to a device. */
+
+static pthread_mutex_t module_call_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void modules_midi_in(void* port, const unsigned char* data, size_t n) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return;
+  pthread_mutex_lock(&module_call_lock);
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if (m->abi < 2 || (m->capabilities & BORG_CAP_MIDI) == 0 ||
+        m->midi_in == NULL) {
+      continue;
+    }
+    m->midi_in(port, data, n);
+  }
+  pthread_mutex_unlock(&module_call_lock);
+}
+
+static void modules_tick(void) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return;
+  if (pthread_mutex_trylock(&module_call_lock) != 0) return;
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if (m->abi < 2 || (m->capabilities & BORG_CAP_MIDI) == 0 ||
+        m->tick == NULL) {
+      continue;
+    }
+    m->tick();
+  }
+  pthread_mutex_unlock(&module_call_lock);
+}
+
+static void module_page_draw(const borg_module* m) {
+  if (m == NULL || m->page_draw == NULL) return;
+  if (pthread_mutex_trylock(&module_call_lock) != 0) return;
+  m->page_draw();
+  pthread_mutex_unlock(&module_call_lock);
+}
+
 static void menu_draw(void) {
   unsigned char fill[12];
   char value[24];
@@ -751,8 +822,7 @@ static void menu_draw(void) {
     const borg_unit_desc* u = page_unit(menu_page);
     if (u != NULL && u->draw != NULL) u->draw(&unit_panel_services, u->user);
   } else {
-    const borg_module* m = page_module(menu_page);
-    if (m != NULL && m->page_draw != NULL) m->page_draw();
+    module_page_draw(page_module(menu_page));
   }
 }
 
@@ -1001,8 +1071,10 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
   while (in < got) out[o++] = buf[in++];
 
   /* The panel reports at 2 Hz even when no key moves. That is the tick a unit
-   * page uses to follow playback; it runs on the panel thread. */
+   * page uses to follow playback, and the one a module gets for work that is
+   * not driven by a read. It runs on the panel thread. */
   if (menu_open) unit_page_redraw();
+  modules_tick();
 
   if (o <= cap) {
     memcpy(buf, out, o);
@@ -1144,12 +1216,197 @@ ssize_t write(int fd, const void* buf, size_t n) {
 
 typedef struct _snd_rawmidi snd_rawmidi_t;
 
+ssize_t snd_rawmidi_write(snd_rawmidi_t* rm, const void* buf, size_t n);
+
+/* The daemon opens each port with one call that hands back an input and an
+ * output handle. A module is given the input handle, and a reply is written to
+ * the output that was returned beside it, so a command that arrives on the DIN
+ * port is answered on the DIN port. The name is the one the daemon opened with,
+ * which is what the module shows on its page. A closed port keeps its row and
+ * the row is reused by the next open, so a handle stays valid for the lifetime
+ * of the module even if the daemon reopens a device. */
+typedef struct midi_port {
+  snd_rawmidi_t* input;
+  snd_rawmidi_t* output;
+  char name[128];
+} midi_port;
+
+static midi_port midi_ports[MIDI_PORT_MAX];
+static int n_midi_ports;
+static pthread_mutex_t midi_ports_lock = PTHREAD_MUTEX_INITIALIZER;
+/* One SysEx message is assembled at a time and handed to the modules whole.
+ * The daemon reads its ports on one thread each, so the accumulator and the
+ * note accounting below are taken under this lock. */
+static pthread_mutex_t midi_account_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char midi_sysex_buf[MIDI_SYSEX_MAX];
+static size_t midi_sysex_len;
+/* The port a message in progress arrived on. A byte on another port abandons
+ * the half-received message rather than mixing two ports into one. */
+static void* midi_sysex_port;
+
 static unsigned char midi_status;
 static unsigned midi_need;
 static unsigned midi_have;
 static int midi_sysex;
 static int midi_first_here;
 static size_t midi_first;
+
+/* Called from snd_rawmidi_open, under no other lock. A handle that is already
+ * known is updated rather than added, because the daemon may open the same
+ * device twice while an old pair is still being torn down. */
+static void midi_port_register(snd_rawmidi_t* in, snd_rawmidi_t* out,
+                               const char* name) {
+  int i;
+  int free_row = -1;
+
+  pthread_mutex_lock(&midi_ports_lock);
+  for (i = 0; i < n_midi_ports; i++) {
+    if (midi_ports[i].input == in) {
+      midi_ports[i].output = out;
+      snprintf(midi_ports[i].name, sizeof midi_ports[i].name, "%s",
+               name != NULL ? name : "");
+      pthread_mutex_unlock(&midi_ports_lock);
+      return;
+    }
+    if (free_row < 0 && midi_ports[i].input == NULL &&
+        midi_ports[i].output == NULL)
+      free_row = i;
+  }
+  if (free_row < 0 && n_midi_ports < MIDI_PORT_MAX) {
+    free_row = n_midi_ports++;
+  }
+  if (free_row >= 0) {
+    midi_ports[free_row].input = in;
+    midi_ports[free_row].output = out;
+    snprintf(midi_ports[free_row].name, sizeof midi_ports[free_row].name,
+             "%s", name != NULL ? name : "");
+  }
+  pthread_mutex_unlock(&midi_ports_lock);
+}
+
+int snd_rawmidi_open(snd_rawmidi_t** in_rmidi, snd_rawmidi_t** out_rmidi,
+                     const char* name, int mode) {
+  static int (*real)(snd_rawmidi_t**, snd_rawmidi_t**, const char*, int);
+  if (real == NULL) real = (int (*)(snd_rawmidi_t**, snd_rawmidi_t**,
+                                    const char*, int))
+      dlsym(RTLD_NEXT, "snd_rawmidi_open");
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -ENOSYS;
+  }
+  {
+    const int rc = real(in_rmidi, out_rmidi, name, mode);
+    if (rc >= 0 && in_rmidi != NULL && *in_rmidi != NULL) {
+      snd_rawmidi_t* out = (out_rmidi != NULL) ? *out_rmidi : NULL;
+      midi_port_register(*in_rmidi, out, name);
+    }
+    return rc;
+  }
+}
+
+int snd_rawmidi_close(snd_rawmidi_t* rm) {
+  static int (*real)(snd_rawmidi_t*);
+  int i;
+  if (real == NULL)
+    real = (int (*)(snd_rawmidi_t*)) dlsym(RTLD_NEXT, "snd_rawmidi_close");
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -ENOSYS;
+  }
+  pthread_mutex_lock(&midi_ports_lock);
+  for (i = 0; i < n_midi_ports; i++) {
+    if (midi_ports[i].input == rm) midi_ports[i].input = NULL;
+    if (midi_ports[i].output == rm) midi_ports[i].output = NULL;
+  }
+  pthread_mutex_unlock(&midi_ports_lock);
+  return real(rm);
+}
+
+static int host_midi_write(void* port, const void* data, size_t n) {
+  snd_rawmidi_t* out = NULL;
+  size_t sent = 0;
+  int waits = 0;
+  int i;
+
+  if (port == NULL || (data == NULL && n > 0)) return -1;
+
+  pthread_mutex_lock(&midi_ports_lock);
+  for (i = 0; i < n_midi_ports; i++) {
+    if (midi_ports[i].input == (snd_rawmidi_t*)port) {
+      out = midi_ports[i].output;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&midi_ports_lock);
+  if (out == NULL) return -1;
+
+  /* The daemon opens its ports non-blocking, so a full output buffer answers
+   * EAGAIN. A reply is small and the buffer drains at the port's own rate, so a
+   * wait is enough; 500 ms covers a full 200-byte chunk on a 31250-baud DIN
+   * socket, and the bound keeps a stuck port from holding up the daemon's MIDI
+   * thread for longer than that. */
+  while (sent < n) {
+    const ssize_t put = snd_rawmidi_write(out, (const char*)data + sent,
+                                          n - sent);
+    if (put > 0) {
+      sent += (size_t)put;
+      waits = 0;
+      continue;
+    }
+    if (put < 0 && errno == EAGAIN && waits < 500) {
+      struct timespec ts;
+      ts.tv_sec = 0;
+      ts.tv_nsec = 1000000L;
+      nanosleep(&ts, NULL);
+      waits++;
+      continue;
+    }
+    return -1;
+  }
+  return 0;
+}
+
+static const char* host_port_name(void* port) {
+  static const char unknown[] = "";
+  const char* name = unknown;
+  int i;
+
+  pthread_mutex_lock(&midi_ports_lock);
+  for (i = 0; i < n_midi_ports; i++) {
+    if (midi_ports[i].input == (snd_rawmidi_t*)port) {
+      name = midi_ports[i].name;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&midi_ports_lock);
+  return name;
+}
+
+static void midi_sysex_begin(void* port) {
+  midi_sysex_len = 1;
+  midi_sysex_buf[0] = 0xf0;
+  midi_sysex_port = port;
+}
+
+static void midi_sysex_put(unsigned char b) {
+  if (midi_sysex_len < MIDI_SYSEX_MAX)
+    midi_sysex_buf[midi_sysex_len++] = b;
+}
+
+/* The terminator is always on the end, even when the message did not fit, so
+ * that a reader refuses the whole message rather than waiting for an end that
+ * is not coming. */
+static void midi_sysex_end(void* port) {
+  if (midi_sysex_len < MIDI_SYSEX_MAX) {
+    midi_sysex_buf[midi_sysex_len++] = 0xf7;
+  } else {
+    midi_sysex_buf[MIDI_SYSEX_MAX - 1] = 0xf7;
+    midi_sysex_len = MIDI_SYSEX_MAX;
+  }
+  modules_midi_in(port, midi_sysex_buf, midi_sysex_len);
+  midi_sysex_len = 0;
+  midi_sysex_port = NULL;
+}
 
 static void midi_note(unsigned char status, size_t note_at, size_t vel_at,
                       unsigned char* buf) {
@@ -1182,7 +1439,7 @@ static void midi_note(unsigned char status, size_t note_at, size_t vel_at,
   }
 }
 
-static void midi_account(unsigned char* buf, size_t n) {
+static void midi_account(unsigned char* buf, size_t n, void* port) {
   size_t i;
 
   if (midi_have > 0) midi_first_here = 0;
@@ -1192,11 +1449,30 @@ static void midi_account(unsigned char* buf, size_t n) {
 
     if (b >= 0xf8) continue;             /* realtime, no state */
     if (midi_sysex) {
-      if (b == 0xf7) midi_sysex = 0;
-      continue;
+      if (midi_sysex_port != port) {
+        /* Another port spoke. Drop the partial message and read this byte as
+         * ordinary MIDI. */
+        midi_sysex = 0;
+        midi_sysex_len = 0;
+        midi_sysex_port = NULL;
+      } else if (b == 0xf7) {
+        midi_sysex = 0;
+        midi_sysex_end(port);
+        continue;
+      } else if (b < 0x80) {
+        midi_sysex_put(b);
+        continue;
+      } else {
+        /* Any other status byte ends the message without a terminator. It is
+         * handled below as the start of what follows. */
+        midi_sysex = 0;
+        midi_sysex_len = 0;
+        midi_sysex_port = NULL;
+      }
     }
     if (b == 0xf0) {
       midi_sysex = 1;
+      midi_sysex_begin(port);
       midi_status = 0;
       midi_need = midi_have = 0;
       continue;
@@ -1252,8 +1528,13 @@ ssize_t snd_rawmidi_read(snd_rawmidi_t* rm, void* buf, size_t n) {
   {
     const ssize_t got = real(rm, buf, n);
     if (got > 0) {
+      pthread_mutex_lock(&midi_account_lock);
       midi_in_bytes += (unsigned long)got;
-      midi_account((unsigned char*)buf, (size_t)got);
+      midi_account((unsigned char*)buf, (size_t)got, rm);
+      pthread_mutex_unlock(&midi_account_lock);
+      /* A read is a pulse for a module that is waiting on something slow, such
+       * as the kernel's helper, so that its answer is picked up promptly. */
+      modules_tick();
     }
     return got;
   }

@@ -25,6 +25,19 @@ A basic module system is added as `.borgmodule` in `/Programs`
 
 ![](./docs/borg-module-hello.png)
 
+ABI 2 also offers MIDI to a module: every complete SysEx message from every port
+the daemon reads, with the reply going out on the paired output. The
+`exec.borgmodule` is the working example. It answers `@exec <command>` on the
+gadget, the DIN sockets or a host-port interface, runs a command through the
+kernel's usermode helper, and has a host tool:
+
+```sh
+./build-module.sh modules/exec/exec.cc
+tools/rgexec.py run 'uname -a'
+```
+
+See [modules/exec/README.md](modules/exec/README.md).
+
 
 Install and use are in [borg_drumlogue/README.md](borg_drumlogue/README.md).
 

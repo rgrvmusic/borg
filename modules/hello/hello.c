@@ -27,10 +27,12 @@ static const borg_module hello_module = {
   "1.0.0",
   BORG_CAP_PAGE,
   hello_init,
-  hello_page
+  hello_page,
+  NULL,
+  NULL
 };
 
 const borg_module* borg_module_entry(uint32_t host_abi) {
-  if (host_abi != BORG_MODULE_ABI) return 0;
+  if (host_abi < 1) return 0;
   return &hello_module;
 }
