@@ -9,9 +9,10 @@ preload object, same pid, with no rootfs writes.
 ![](./docs/borg-screen.png)
 
 
-The loaded object adds a status menu, opened with MUTE and MASTER, an optional
-MIDI note and velocity transform, and a loader for `.borgmodule` pages kept in
-the instrument's userfs.
+The loaded object adds a status menu, opened with MUTE and MASTER, a writable
+MIDI transform for modules (the transpose and velocity controls are
+`transform.borgmodule`, on its own page rather than hidden settings), and a
+loader for `.borgmodule` pages kept in the instrument's userfs.
 
 Build with
 
@@ -37,6 +38,12 @@ tools/borgexec.py run 'uname -a'
 ```
 
 See [modules/exec/README.md](modules/exec/README.md).
+
+ABI 4 adds a module's own audio on the daemon's playback path and every channel
+MIDI message before the daemon's unit sees it. ABI 5 adds a writable MIDI
+transform, so a module can change the note the daemon's unit plays;
+`transform.borgmodule` is the example. ABI 1–4 modules keep working unchanged.
+See [borg_drumlogue/README.md](borg_drumlogue/README.md).
 
 
 Install and use are in [borg_drumlogue/README.md](borg_drumlogue/README.md).

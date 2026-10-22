@@ -316,9 +316,9 @@ const borg_module* Boot() {
   g_host.port_name = HostName;
 
   const borg_module* m = borg_module_entry(BORG_MODULE_ABI);
-  Check(m != NULL, "the entry answers for ABI 2");
+  Check(m != NULL, "the entry answers for the current ABI");
   if (m == NULL) return NULL;
-  Check(m->abi == BORG_MODULE_ABI, "the module reports ABI 2");
+  Check(m->abi == BORG_MODULE_ABI, "the module reports the current ABI");
   Check((m->capabilities & BORG_CAP_MIDI) != 0, "it asks for MIDI");
   Check((m->capabilities & BORG_CAP_PAGE) != 0, "it asks for a page");
   Check(m->init(&g_host, g_scratch) == 0, "init accepts the host");

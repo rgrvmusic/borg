@@ -211,7 +211,8 @@ const borg_host g_host = {
   HostDark,
   HostRow,
   HostWrite,
-  HostName
+  HostName,
+  0  // samplerate (ABI 4)
 };
 
 std::string SysEx(const std::string& body) {
@@ -506,14 +507,14 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  const borg_module* m = borg_module_entry(3);
-  Check(m != NULL, "entry offers ABI 3");
+  const borg_module* m = borg_module_entry(BORG_MODULE_ABI);
+  Check(m != NULL, "entry offers the current ABI");
   Check(borg_module_entry(2) == NULL, "entry refuses an older host");
   if (m == NULL) {
     fprintf(stderr, "%d checks, %d failed\n", g_checks, g_failures);
     return 1;
   }
-  Check(m->abi == 3, "the module is ABI 3");
+  Check(m->abi == BORG_MODULE_ABI, "the module declares the current ABI");
   Check((m->capabilities & BORG_CAP_INPUT) != 0, "the module asks for input");
 
   Check(m->init(&g_host, "/scratch/storage.borgmodule") == 0, "init succeeds");

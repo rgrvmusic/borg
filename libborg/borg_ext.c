@@ -5,10 +5,12 @@
  *          neither the chord nor the keys, and cannot paint over the page.
  *          PAGE up/down moves between pages; the same chord closes it, and
  *          the daemon's last screen is replayed.
- * midi     every byte through snd_rawmidi_read/write is counted. Note
- *          messages that arrive whole in one read can be transposed or
- *          velocity-curved (LOGUE_BORG_MIDI_TRANSPOSE,
- *          LOGUE_BORG_MIDI_VELOCITY, both off by default).
+ * midi     every byte through snd_rawmidi_read/write is counted. A module that
+ *          asks for BORG_CAP_MIDI_TRANSFORM is offered each complete channel
+ *          message before the daemon's unit, with writable data bytes; the
+ *          note transpose and velocity curve are `transform.borgmodule`, not a
+ *          setting of this object, because an environment variable is not
+ *          something the instrument can reach once its daemon has started.
  *
  * No symbol is resolved from a constructor: that window kills this daemon.
  * Every interposer resolves its real function on the first call it serves.
@@ -110,11 +112,70 @@ static int pending_whole;
 static unsigned long midi_in_bytes, midi_out_bytes;
 static unsigned long midi_in_msgs, midi_out_msgs, midi_notes;
 static unsigned long midi_last_status, midi_last_note, midi_last_vel;
-static int midi_transpose;
-static int midi_velocity = 100;
 
 static unsigned long audio_calls, audio_errors;
 static unsigned long menu_opens;
+
+/* What the playback stream resolved to, and how many blocks the modules were
+ * actually mixed into. On the drumlogue the stream is the codec's own shape --
+ * S24_LE, eight channels -- and an entry point that is entered but mixes
+ * nothing looks exactly like one that mixes silence: `audio_calls` counts the
+ * daemon's writes either way. These two are what tell them apart on the STATUS
+ * page, where there is no console to read. */
+static int audio_pcm_format = -1;
+static unsigned audio_pcm_channels;
+static unsigned long audio_mixed;
+/* Why the last block was passed through instead of mixed. The counters are
+ * written on the audio thread and read on the panel thread, so they are
+ * accessed atomically; the enum is the value in `pcm_skip`. */
+enum {
+  PCM_SKIP_NONE = 0,
+  PCM_SKIP_NO_MODULE,   /* no module asked for audio */
+  PCM_SKIP_UNRESOLVED,  /* the stream's format is not known yet */
+  PCM_SKIP_BUSY,        /* another block holds the scratch buffer */
+  PCM_SKIP_BIG          /* the block does not fit the scratch buffer */
+};
+static int pcm_skip;
+static unsigned long pcm_skips, pcm_scratch_steals;
+static int pcm_skip_logged;             /* panel thread only */
+/* Where the audio thread's time went, published for the panel thread. A block
+ * that is mixed and still misses the period is a load question, and the two
+ * numbers that answer it are the whole block's cost and the module's part of
+ * it: 64 frames is 1333 us on the drumlogue, so a block near that is the
+ * cause and a block in tens of us is not. `pcm_get_slow` counts blocks that
+ * took the lock because the stream was not resolved on the fast path -- that
+ * path does allocation and ALSA calls, and one per block would be a far more
+ * expensive bug than the synth. */
+static unsigned long long pcm_mix_ns_last, pcm_mix_ns_max;
+static unsigned long long pcm_mod_ns_last, pcm_mod_ns_max;
+static unsigned long pcm_get_slow;
+static int pcm_write_err;               /* last negative writei return */
+
+/* Defined with the audio path below; the STATUS page reports its numbers. */
+static unsigned long long pcm_now_ms(void);
+
+static const char* pcm_skip_name(int reason) {
+  switch (reason) {
+    case PCM_SKIP_NO_MODULE: return "no module asked for audio";
+    case PCM_SKIP_UNRESOLVED: return "stream format not resolved";
+    case PCM_SKIP_BUSY: return "scratch buffer busy";
+    case PCM_SKIP_BIG: return "block larger than the scratch buffer";
+    default: return "mixed";
+  }
+}
+
+static char pcm_skip_letter(int reason) {
+  switch (reason) {
+    case PCM_SKIP_NO_MODULE: return 'n';
+    case PCM_SKIP_UNRESOLVED: return 'u';
+    case PCM_SKIP_BUSY: return 'b';
+    case PCM_SKIP_BIG: return 's';
+    default: return '-';
+  }
+}
+
+/* Defined with the audio hook below; the STATUS page draws the format name. */
+static const char* pcm_format_name(int format);
 
 static time_t start_epoch;
 
@@ -131,14 +192,6 @@ static void raw_log(const char* path, const char* line) {
 }
 
 __attribute__((constructor)) static void borg_ext_init(void) {
-  const char* t = getenv("LOGUE_BORG_MIDI_TRANSPOSE");
-  const char* v = getenv("LOGUE_BORG_MIDI_VELOCITY");
-  if (t != NULL) midi_transpose = atoi(t);
-  if (v != NULL) {
-    midi_velocity = atoi(v);
-    if (midi_velocity < 1) midi_velocity = 1;
-    if (midi_velocity > 200) midi_velocity = 200;
-  }
   start_epoch = time(NULL);
 }
 
@@ -327,6 +380,7 @@ static void host_log(const char* line) {
 
 static const char* host_path(int which) {
   if (which == BORG_PATH_TMP) return "/tmp";
+  if (which == BORG_PATH_UNITS) return "/var/lib/drumlogued/userfs/Units/Synths";
   return "/var/lib/drumlogued/userfs/Programs";
 }
 
@@ -349,10 +403,13 @@ static void host_row(unsigned y, const char* label, const char* value) {
 static int host_midi_write(void* port, const void* data, size_t n);
 static const char* host_port_name(void* port);
 
-static const borg_host host_services = {
+/* ABI 4 adds samplerate, which the audio hook fills in once it has seen the
+ * daemon's playback stream. It is written before the first block is mixed and
+ * never changed after, so a module may read it without an atomic. */
+static borg_host host_services = {
   (uint32_t)sizeof(borg_host), BORG_MODULE_ABI,
   host_log, host_path, host_text, host_dark, host_row,
-  host_midi_write, host_port_name
+  host_midi_write, host_port_name, 0
 };
 
 /* ------------------------------------------------------------ the unit pages
@@ -694,6 +751,66 @@ static void modules_midi_in(void* port, const unsigned char* data, size_t n) {
   pthread_mutex_unlock(&module_call_lock);
 }
 
+/* ABI 4. One complete channel message, serialized with the other module calls
+ * because it is not an audio-path callback: the module is allowed to do here
+ * what midi_in may do. Any note transform has already been applied by the time
+ * it is offered, so a module hears the notes the daemon's own unit hears. */
+static void modules_midi_msg(void* port, const unsigned char* data, size_t n) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return;
+  pthread_mutex_lock(&module_call_lock);
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if (m->abi < 4 || (m->capabilities & BORG_CAP_MIDI_EVENTS) == 0 ||
+        m->midi_msg == NULL) {
+      continue;
+    }
+    m->midi_msg(port, data, n);
+  }
+  pthread_mutex_unlock(&module_call_lock);
+}
+
+/* ABI 5, and before midi_msg: the message is still the daemon's to play, so a
+ * module may rewrite it. The lock is the same one midi_in and midi_msg take --
+ * a transform module is offered the same host services they are, and the host
+ * serializes all of them. */
+static void modules_midi_transform(void* port, unsigned char* data, size_t n) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return;
+  pthread_mutex_lock(&module_call_lock);
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if (m->abi < 5 || (m->capabilities & BORG_CAP_MIDI_TRANSFORM) == 0 ||
+        m->midi_transform == NULL) {
+      continue;
+    }
+    m->midi_transform(port, data, n);
+  }
+  pthread_mutex_unlock(&module_call_lock);
+}
+
+/* The tab name of the first transform module, or "NONE". The menu's MIDI page
+ * has no setting of its own to show any more; what it can honestly report is
+ * whether something is loaded that changes the notes. */
+static const char* modules_transform_name(void) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return "NONE";
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if (m->abi >= 5 && (m->capabilities & BORG_CAP_MIDI_TRANSFORM) != 0 &&
+        m->midi_transform != NULL && m->name != NULL) {
+      return m->name;
+    }
+  }
+  return "NONE";
+}
+
 static void modules_tick(void) {
   const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
   int i;
@@ -756,6 +873,41 @@ static void modules_encoder(int page, int index, int delta) {
   pthread_mutex_lock(&module_call_lock);
   m->encoder(index, delta);
   pthread_mutex_unlock(&module_call_lock);
+}
+
+/* ABI 4 audio. Deliberately not serialized by module_call_lock: the audio
+ * thread must never wait for a MIDI command or a page draw to finish. The
+ * module set is immutable once published, so the walk needs no lock either.
+ * `out` arrives zeroed and every module adds to it, which lets several audio
+ * modules and the daemon's own mix share one buffer. */
+static int modules_have_audio(void) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return 0;
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if (m->abi >= 4 && (m->capabilities & BORG_CAP_AUDIO) != 0 &&
+        m->audio_render != NULL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void modules_audio(float* out, uint32_t frames) {
+  const module_set* set = __atomic_load_n(&module_set_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return;
+  for (i = 0; i < set->n_modules; i++) {
+    const borg_module* m = set->mod[i];
+    if (m->abi < 4 || (m->capabilities & BORG_CAP_AUDIO) == 0 ||
+        m->audio_render == NULL) {
+      continue;
+    }
+    m->audio_render(out, frames);
+  }
 }
 
 static void menu_draw(void) {
@@ -852,10 +1004,97 @@ static void menu_draw(void) {
       snprintf(value, sizeof value, "%ld S", up);
     }
     menu_row(35, "UPTIME:", value);
-    snprintf(value, sizeof value, "%lu", audio_calls);
-    menu_row(44, "AUDIO CALLS:", value);
-    snprintf(value, sizeof value, "%lu / %lu", audio_errors, menu_opens);
-    menu_row(53, "XRUNS/OPENS:", value);
+    {
+      const unsigned long mixed =
+          __atomic_load_n(&audio_mixed, __ATOMIC_RELAXED);
+      const unsigned long calls =
+          __atomic_load_n(&audio_calls, __ATOMIC_RELAXED);
+      const int format =
+          __atomic_load_n(&audio_pcm_format, __ATOMIC_RELAXED);
+      const unsigned channels =
+          __atomic_load_n(&audio_pcm_channels, __ATOMIC_RELAXED);
+      const int skip = __atomic_load_n(&pcm_skip, __ATOMIC_RELAXED);
+
+      /* A block that is entered but not mixed is the failure this page exists
+       * to make visible: the call counter rises, the modules hear MIDI, and
+       * nothing is rendered. The reason is logged once per change, on the
+       * panel thread, so a report from the instrument says which one it was
+       * instead of only that there was no sound. */
+      if (calls > 0 && mixed == 0 && skip != pcm_skip_logged) {
+        pcm_skip_logged = skip;
+        module_logf("audio: %lu write(s), none mixed: %s (format %d, %u ch, "
+                    "%lu skipped, %lu steals)",
+                    calls, pcm_skip_name(skip), format, channels,
+                    __atomic_load_n(&pcm_skips, __ATOMIC_RELAXED),
+                    __atomic_load_n(&pcm_scratch_steals, __ATOMIC_RELAXED));
+      }
+      /* One letter is enough to name the reason in the row, and the log line
+       * above has the words. `x` is the one case pcm_mix cannot name: neither
+       * write entry point has been entered at all, so nothing was passed
+       * through and no reason was recorded -- the daemon's playback is going
+       * somewhere this object does not hook. */
+      if (mixed == 0 && calls == 0) {
+        snprintf(value, sizeof value, "0/0 x");
+      } else if (mixed == 0 && skip != PCM_SKIP_NONE) {
+        snprintf(value, sizeof value, "%lu/%lu %c", mixed, calls,
+                 pcm_skip_letter(skip));
+      } else {
+        snprintf(value, sizeof value, "%lu/%lu", mixed, calls);
+      }
+      menu_row(44, "MIXED/CALLS:", value);
+
+      /* One line the first time a shape is actually mixed into, so a report
+       * from the instrument says which path resolved the stream rather than
+       * leaving it to be inferred from the panel. Written on the panel thread:
+       * the audio path must not do file I/O. */
+      {
+        static int logged_format = -1;
+        static unsigned logged_channels;
+        if (format >= 0 && channels > 0 &&
+            (format != logged_format || channels != logged_channels)) {
+          logged_format = format;
+          logged_channels = channels;
+          module_logf("audio: mixing %s %u ch, %lu mixed of %lu writes",
+                      pcm_format_name(format), channels, mixed, calls);
+        }
+      }
+
+      /* Where the audio thread's time went. Written every two seconds while
+       * this page is open, so a run that crackles says whether the mix is
+       * anywhere near the 1333 us a 64-frame block allows, and whether the
+       * module's render is the whole of it. `last write` is the negative
+       * return of the most recent failed write -- -EPIPE is an overrun of the
+       * deadline, anything else is a different story. Every five seconds, not
+       * every draw: this writes to the instrument's own userfs. */
+      {
+        static unsigned long long diag_ms;
+        const unsigned long long now_ms = pcm_now_ms();
+        if (now_ms - diag_ms >= 5000) {
+          diag_ms = now_ms;
+          module_logf(
+              "audio: mix %llu us (module %llu us), max %llu us; "
+              "%lu mixed/%lu writes, %lu xruns, last write %d, %lu slow gets",
+              __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED) / 1000,
+              __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED) / 1000,
+              __atomic_load_n(&pcm_mix_ns_max, __ATOMIC_RELAXED) / 1000, mixed,
+              calls, __atomic_load_n(&audio_errors, __ATOMIC_RELAXED),
+              __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED),
+              __atomic_load_n(&pcm_get_slow, __ATOMIC_RELAXED));
+        }
+      }
+
+      /* An unknown format shows its numeric id, so a stream this code refuses
+       * can be named from the panel without a console. */
+      if (pcm_format_name(format)[0] == '?') {
+        snprintf(value, sizeof value, "F%d %uC/%lu", format, channels,
+                 __atomic_load_n(&audio_errors, __ATOMIC_RELAXED));
+      } else {
+        snprintf(value, sizeof value, "%s %uC/%lu", pcm_format_name(format),
+                 channels,
+                 __atomic_load_n(&audio_errors, __ATOMIC_RELAXED));
+      }
+      menu_row(53, "PCM/XRUNS:", value);
+    }
   } else if (menu_page == 1) {
     snprintf(value, sizeof value, "%lu / %lu B", midi_in_bytes, midi_out_bytes);
     menu_row(26, "MIDI I/O:", value);
@@ -864,8 +1103,9 @@ static void menu_draw(void) {
     snprintf(value, sizeof value, "%02lX %02lX %02lX", midi_last_status,
              midi_last_note, midi_last_vel);
     menu_row(44, "LAST NOTE:", value);
-    snprintf(value, sizeof value, "%+d / %d%%", midi_transpose, midi_velocity);
-    menu_row(53, "TRANS/VEL:", value);
+    /* The transform is a module now, so the page says whether one is loaded
+     * rather than showing settings this object no longer owns. */
+    menu_row(53, "XFORM:", modules_transform_name());
   } else if (menu_page < module_page_base()) {
     const borg_unit_desc* u = page_unit(menu_page);
     if (u != NULL && u->draw != NULL) u->draw(&unit_panel_services, u->user);
@@ -1418,6 +1658,10 @@ static void* midi_sysex_port;
 static unsigned char midi_status;
 static unsigned midi_need;
 static unsigned midi_have;
+/* The data bytes of the message in progress, kept across reads so that a
+ * message split by the daemon's read size can still be offered whole to an
+ * ABI 4 module. */
+static unsigned char midi_data[2];
 static int midi_sysex;
 static int midi_first_here;
 static size_t midi_first;
@@ -1579,35 +1823,55 @@ static void midi_sysex_end(void* port) {
   midi_sysex_port = NULL;
 }
 
-static void midi_note(unsigned char status, size_t note_at, size_t vel_at,
-                      unsigned char* buf) {
-  int note = buf[note_at];
-  int vel = buf[vel_at];
-
-  if (midi_transpose != 0) {
-    note += midi_transpose;
-    if (note < 0) note = 0;
-    if (note > 127) note = 127;
-    buf[note_at] = (unsigned char)note;
-  }
-  if ((status & 0xf0) == 0x90 && vel > 0 && midi_velocity != 100) {
-    vel = (vel * midi_velocity + 50) / 100;
-    if (vel < 1) vel = 1;
-    if (vel > 127) vel = 127;
-    buf[vel_at] = (unsigned char)vel;
-  }
-
+/* Counts and logs a note the daemon will play. The bytes are the ones that
+ * reached the daemon, after any transform module had them. */
+static void midi_note(unsigned char status, unsigned char note,
+                      unsigned char vel) {
   midi_notes++;
   midi_last_status = status;
-  midi_last_note = (unsigned long)buf[note_at];
-  midi_last_vel = (unsigned long)buf[vel_at];
+  midi_last_note = (unsigned long)note;
+  midi_last_vel = (unsigned long)vel;
 
   {
     char line[64];
-    snprintf(line, sizeof line, "note %02x %02x %02x\n", status,
-             buf[note_at], buf[vel_at]);
+    snprintf(line, sizeof line, "note %02x %02x %02x\n", status, note, vel);
     raw_log(LOGUE_BORG_MIDI_LOG, line);
   }
+}
+
+/* A complete channel message on its way to the daemon's unit. A transform
+ * module may rewrite the data bytes; what the daemon reads out of `buf` and
+ * what every MIDI_EVENTS module is offered is the result, so the two cannot
+ * disagree about a note that was in this read. System messages are not offered
+ * here; SysEx goes to midi_in instead, and realtime bytes have no state.
+ *
+ * A message whose first data byte arrived in an earlier read cannot be
+ * rewritten there -- that buffer has been handed back -- so only the copy the
+ * modules see carries the transform for it. That is the one case where the
+ * daemon plays what the wire sent. */
+static void midi_channel_msg(void* port, unsigned char* buf, size_t n,
+                             size_t first, int first_here) {
+  const unsigned char status = midi_status;
+  const size_t len = midi_need + 1;
+  unsigned char msg[3];
+
+  if ((status & 0x80) == 0 || (status & 0xf0) == 0xf0) return;
+  if (midi_need < 1 || midi_need > 2) return;
+
+  msg[0] = status;
+  msg[1] = midi_data[0];
+  msg[2] = midi_data[1];
+  modules_midi_transform(port, msg, len);
+  midi_data[0] = msg[1];
+  midi_data[1] = msg[2];
+
+  if (first_here && ((status & 0xf0) == 0x90 || (status & 0xf0) == 0x80) &&
+      first + 1 < n) {
+    buf[first] = msg[1];
+    buf[first + 1] = msg[2];
+    midi_note(status, msg[1], msg[2]);
+  }
+  modules_midi_msg(port, msg, len);
 }
 
 static void midi_account(unsigned char* buf, size_t n, void* port) {
@@ -1662,6 +1926,7 @@ static void midi_account(unsigned char* buf, size_t n, void* port) {
       midi_status = b;
       midi_need = ((b & 0xf0) == 0xc0 || (b & 0xf0) == 0xd0) ? 1 : 2;
       midi_have = 0;
+      midi_data[0] = midi_data[1] = 0;
       midi_first_here = 1;
       midi_first = i + 1;
       midi_in_msgs++;
@@ -1673,15 +1938,11 @@ static void midi_account(unsigned char* buf, size_t n, void* port) {
       midi_first = i;
       midi_first_here = 1;
     }
+    if (midi_have < 2) midi_data[midi_have] = b;
     midi_have++;
 
     if (midi_have == midi_need) {
-      const unsigned char status = midi_status;
-      if (midi_first_here &&
-          ((status & 0xf0) == 0x90 || (status & 0xf0) == 0x80) &&
-          midi_first + 1 < n) {
-        midi_note(status, midi_first, midi_first + 1, buf);
-      }
+      midi_channel_msg(port, buf, n, midi_first, midi_first_here);
       midi_have = 0;
       midi_first_here = 0;
     }
@@ -1733,22 +1994,707 @@ ssize_t snd_rawmidi_write(snd_rawmidi_t* rm, const void* buf, size_t n) {
   }
 }
 
-/* ----------------------------------------------------------------- the audio */
+/* ----------------------------------------------------------------- the audio
+ *
+ * ABI 4 lets a module add to the daemon's playback. The daemon hands ALSA a
+ * buffer and this hook mixes the modules' float stereo contribution into it
+ * just before the real call. Both entry points the daemon uses are covered:
+ * writei and mmap_writei take the same arguments from here.
+ *
+ * Nothing on this path may block, allocate in a loop, or take a lock that the
+ * panel or MIDI thread can hold. The module set is immutable and lock-free.
+ * The stream's shape is recorded where the daemon installs it
+ * (snd_pcm_hw_params), so it is known before the first block; the slower
+ * snd_pcm_hw_params_current path is a retried fallback for a stream configured
+ * before this object was preloaded. A read that fails is never remembered: a
+ * stream that could not be resolved once must not stay unresolved for the rest
+ * of the run, which is how the mix went silent while the call counter rose.
+ * The mix is built in one static scratch buffer, guarded by an atomic so that a
+ * second stream (or a re-entrant call) skips the extra synth rather than
+ * corrupting the first; an owner that has held it for a second is gone and the
+ * block is taken over, so a lost flag cannot silence the module for good.
+ *
+ * A format this code cannot convert is skipped in silence rather than guessed
+ * at: converting an S24 block as if it were S16 would not be a quiet failure,
+ * it would be noise. S16_LE, S24_LE, S32_LE and FLOAT_LE are what libasound
+ * uses for a daemon's output; S24_LE is the one the drumlogue itself uses.
+ *
+ * That last point is why this file carries S24 at all. The daemon opens the
+ * pcm3168a codec as `hw:0,0` at the codec's own shape: S24_LE, eight channels,
+ * 48 kHz, MMAP_INTERLEAVED, 64-frame periods. Until S24 was handled here, every
+ * block was skipped -- `snd_pcm_writei` was still entered, so the STATUS page's
+ * call counter kept rising, while not one module render was ever asked for.
+ * The one measurement behind the eight-channel shape is the mk2 daemon's
+ * output tap, where all eight channels carry the same programme material; the
+ * drumlogue's daemon writes the same shape, and a module's stereo pair is added
+ * to every stereo pair it finds, so the mix is heard whichever pair the codec's
+ * routing puts on the jack. */
 
 typedef struct _snd_pcm snd_pcm_t;
+
+#define PCM_INFO_MAX 4
+/* The daemon opens the codec with a 256-frame buffer; 2048 is headroom for a
+ * larger period without carrying a quarter of a megabyte of BSS in a daemon
+ * that has little of it to spare. A block bigger than this is passed through
+ * unmixed rather than truncated. */
+#define PCM_SCRATCH_FRAMES 2048
+#define AUDIO_CHUNK 64
+
+/* The codec's eight outputs are the widest stream this hook has to hold; one
+ * scratch buffer sized for that is what makes the copy cost one memcpy. */
+#define PCM_MAX_CHANNELS 8
+
+/* snd_pcm_format_t values, from alsa/pcm.h. Only these four are converted. */
+#define PCM_FORMAT_S16_LE 2
+#define PCM_FORMAT_S24_LE 6         /* 24 significant bits in a 4-byte slot */
+#define PCM_FORMAT_S32_LE 10
+#define PCM_FORMAT_FLOAT_LE 14
+
+/* S24_LE's full scale is 2^23 - the sample occupies the low three bytes. */
+#define PCM_S24_FULL_SCALE 8388608
+
+static const char* pcm_format_name(int format) {
+  switch (format) {
+    case PCM_FORMAT_S16_LE: return "S16";
+    case PCM_FORMAT_S24_LE: return "S24";
+    case PCM_FORMAT_S32_LE: return "S32";
+    case PCM_FORMAT_FLOAT_LE: return "FLT";
+    case -1: return "NONE";
+    default: return "?";
+  }
+}
+
+typedef struct pcm_info {
+  snd_pcm_t* pcm;
+  int resolved;
+  int format;
+  unsigned channels;
+  unsigned rate;
+  unsigned bytes;
+  unsigned long seq;      /* allocation order; the oldest slot is evicted */
+  unsigned attempts;      /* failed fallback reads, for the retry backoff */
+} pcm_info;
+
+static pcm_info pcm_infos[PCM_INFO_MAX];
+static pthread_mutex_t pcm_info_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long pcm_info_seq;          /* guarded by pcm_info_lock */
+static unsigned char pcm_scratch[PCM_SCRATCH_FRAMES * PCM_MAX_CHANNELS * 4]
+    __attribute__((aligned(8)));
+static int pcm_scratch_busy;
+static unsigned long long pcm_scratch_stamp;    /* ms, when busy was taken */
+
+/* The getters are not declared here: libborg does not include ALSA's headers,
+ * because the unit container has no reason to carry them. They are resolved
+ * from the library the daemon already linked. */
+typedef int (*hw_malloc_fn)(void**);
+typedef int (*hw_current_fn)(snd_pcm_t*, void*);
+typedef int (*hw_format_fn)(const void*, int*);
+typedef int (*hw_channels_fn)(const void*, unsigned*);
+typedef int (*hw_rate_fn)(const void*, unsigned*, int*);
+typedef int (*hw_free_fn)(void*);
+
+static struct {
+  hw_malloc_fn malloc;
+  hw_current_fn current;
+  hw_format_fn format;
+  hw_channels_fn channels;
+  hw_rate_fn rate;
+  hw_free_fn free;
+} pcm_api;
+
+/* Resolve the real libasound function. RTLD_NEXT is the normal answer and is
+ * known to work here -- the write path binds through it, which is how a call
+ * count rises at all. The handle is asked as a fallback for a link map where
+ * libasound does not follow this object (a preload that is not first, or a
+ * daemon that loads ALSA itself, where a pthread_once that ran before the
+ * library was mapped would otherwise leave this table NULL for the run).
+ * Getting this wrong in the other direction is worse: an interposer that
+ * cannot find the real function reports ENOSYS and breaks the daemon's audio
+ * setup instead of merely failing to record its shape. */
+static void* pcm_real(const char* name) {
+  void* p = dlsym(RTLD_NEXT, name);
+
+  if (p == NULL) {
+    static void* lib;                 /* never closed: the daemon owns it */
+    if (lib == NULL) lib = dlopen("libasound.so.2", RTLD_NOW | RTLD_NOLOAD);
+    if (lib != NULL) p = dlsym(lib, name);
+  }
+  return p;
+}
+
+/* Plain dlsym() is the modern ABI here, and that was measured rather than
+ * assumed: on the device's own libasound, dlsym()'s default
+ * snd_pcm_hw_params_get_format writes its out-parameter and returns 0, while
+ * dlvsym(..., "ALSA_0.9") is the legacy value-returning one and returns the
+ * format itself (6) with the out-parameter untouched. Reaching for the
+ * versioned symbol therefore breaks the read instead of fixing it -- the
+ * caller sees a non-zero return and calls the stream unresolved, which is the
+ * `u` the panel shows. The default version of a symbol is the current ABI in
+ * every libasound, so dlsym() is the correct and portable choice. */
+static void pcm_api_init(void) {
+  pcm_api.malloc = (hw_malloc_fn)pcm_real("snd_pcm_hw_params_malloc");
+  pcm_api.current = (hw_current_fn)pcm_real("snd_pcm_hw_params_current");
+  pcm_api.free = (hw_free_fn)pcm_real("snd_pcm_hw_params_free");
+  pcm_api.format = (hw_format_fn)pcm_real("snd_pcm_hw_params_get_format");
+  pcm_api.channels = (hw_channels_fn)pcm_real("snd_pcm_hw_params_get_channels");
+  pcm_api.rate = (hw_rate_fn)pcm_real("snd_pcm_hw_params_get_rate");
+}
+
+/* Called only with pcm_info_lock held. Not pthread_once: if the first lookup
+ * happened before libasound was mapped, a one-shot would remember that empty
+ * table for the life of the process, and every later stream would be passed
+ * through as unresolved. Retrying costs a handful of dlsym calls on an
+ * unresolved stream and stops as soon as the table is complete. */
+static void pcm_api_lookup(void) {
+  if (pcm_api.malloc != NULL && pcm_api.current != NULL &&
+      pcm_api.free != NULL && pcm_api.format != NULL &&
+      pcm_api.channels != NULL && pcm_api.rate != NULL) {
+    return;
+  }
+  pcm_api_init();
+}
+
+static unsigned long long pcm_now_ms(void) {
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 1;
+  return (unsigned long long)ts.tv_sec * 1000 +
+         (unsigned long long)ts.tv_nsec / 1000000;
+}
+
+static unsigned long long pcm_now_ns(void) {
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 1;
+  return (unsigned long long)ts.tv_sec * 1000000000ULL +
+         (unsigned long long)ts.tv_nsec;
+}
+
+/* A maximum written from the audio thread and read from the panel thread.
+ * compare_exchange rather than a load/store pair so two writers cannot lose
+ * the larger value. */
+static void pcm_note_max(unsigned long long* slot, unsigned long long value) {
+  unsigned long long cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
+
+  while (value > cur &&
+         !__atomic_compare_exchange_n(slot, &cur, value, 0, __ATOMIC_RELAXED,
+                                      __ATOMIC_RELAXED)) {
+  }
+}
+
+static void pcm_skip_set(int reason) {
+  __atomic_store_n(&pcm_skip, reason, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&pcm_skips, 1, __ATOMIC_RELAXED);
+}
+
+/* Merge one shape into an entry and say whether this code can mix it. A field
+ * that is not being supplied is passed as -1 (format) or 0 (channels, rate)
+ * and the entry keeps what it had: the daemon sets the three fields in
+ * separate calls, and a stream is usable as soon as the format and the channel
+ * count are known. The rate is not required -- it does not affect mixing, and
+ * a failed rate read used to be enough to keep a stream unresolved.
+ *
+ * An unsupported format is kept so the STATUS page can name it, but the entry
+ * is not marked resolved, so a later call can correct it. Latching a failure
+ * here is what once disarmed the mix for the life of the process: the daemon
+ * entered the hook on every block, the call counter rose, and not one module
+ * render was ever asked for. */
+static int pcm_info_set(pcm_info* pi, int format, unsigned channels,
+                        unsigned rate) {
+  unsigned bytes = 0;
+
+  if (format >= 0) pi->format = format;
+  if (channels > 0) pi->channels = channels;
+  if (rate > 0) pi->rate = rate;
+
+  if (pi->format == PCM_FORMAT_S16_LE) {
+    bytes = 2;
+  } else if (pi->format == PCM_FORMAT_S24_LE ||
+             pi->format == PCM_FORMAT_S32_LE ||
+             pi->format == PCM_FORMAT_FLOAT_LE) {
+    bytes = 4;
+  }
+  pi->bytes = bytes;
+  /* A module that initialises a unit reads this once the stream is known; 0
+   * before that is documented as "treat as 48000". */
+  if (pi->rate > 0) host_services.samplerate = pi->rate;
+  if (bytes == 0 || pi->channels == 0 || pi->channels > PCM_MAX_CHANNELS) {
+    __atomic_store_n(&pi->resolved, 0, __ATOMIC_RELEASE);
+    return 0;
+  }
+  /* The values shown on the panel are published from pcm_mix, not here: the
+   * daemon opens a capture stream too, and publishing from the hook lets the
+   * capture shape overwrite the playback shape on a page that is describing
+   * what the modules are mixed into. */
+  __atomic_store_n(&pi->resolved, 1, __ATOMIC_RELEASE);
+  return 1;
+}
+
+static int pcm_info_from_params(pcm_info* pi, const void* params) {
+  int fmt = -1;
+  unsigned channels = 0, rate = 0;
+  int dir = 0;
+
+  pcm_api_lookup();
+  if (pcm_api.format == NULL || pcm_api.channels == NULL ||
+      pcm_api.rate == NULL) {
+    return 0;
+  }
+  if (pcm_api.format(params, &fmt) != 0) return 0;
+  if (pcm_api.channels(params, &channels) != 0) return 0;
+  if (pcm_api.rate(params, &rate, &dir) != 0) return 0;
+  return pcm_info_set(pi, fmt, channels, rate);
+}
+
+/* The fallback, for a stream that was configured before this object was
+ * preloaded. pcm_info_get retries it; a failure is not remembered. */
+static int pcm_info_from_current(pcm_info* pi) {
+  void* params = NULL;
+  int ok = 0;
+
+  pcm_api_lookup();
+  if (pcm_api.malloc == NULL || pcm_api.current == NULL ||
+      pcm_api.format == NULL || pcm_api.channels == NULL ||
+      pcm_api.rate == NULL || pcm_api.free == NULL) {
+    return 0;
+  }
+  if (pcm_api.malloc(&params) != 0 || params == NULL) return 0;
+  if (pcm_api.current(pi->pcm, params) == 0) {
+    ok = pcm_info_from_params(pi, params);
+  }
+  pcm_api.free(params);
+  return ok;
+}
+
+/* Find the entry for a stream, allocating or evicting one. The caller holds
+ * pcm_info_lock. */
+static pcm_info* pcm_info_slot(snd_pcm_t* pcm) {
+  int i;
+
+  for (i = 0; i < PCM_INFO_MAX; i++) {
+    if (pcm_infos[i].pcm == pcm) return &pcm_infos[i];
+  }
+  for (i = 0; i < PCM_INFO_MAX; i++) {
+    if (pcm_infos[i].pcm == NULL) break;
+  }
+  if (i == PCM_INFO_MAX) {
+    /* A daemon that closes and reopens its stream would otherwise run out of
+     * slots, and every later stream would be passed through for the rest of
+     * the run -- a silence indistinguishable from a broken module. Evict the
+     * entry that was seen first. */
+    int oldest = 0;
+    for (i = 1; i < PCM_INFO_MAX; i++) {
+      if (pcm_infos[i].seq < pcm_infos[oldest].seq) oldest = i;
+    }
+    i = oldest;
+  }
+  memset(&pcm_infos[i], 0, sizeof pcm_infos[i]);
+  pcm_infos[i].pcm = pcm;
+  pcm_infos[i].seq = ++pcm_info_seq;
+  /* -1, not 0: zero is a real ALSA format id (S8), and an entry that has not
+   * been told anything yet must not read as if the stream were S8. The panel
+   * showed `F0 0C` for a stream no call had described, which is the same
+   * reading a real S8 stream would give. */
+  pcm_infos[i].format = -1;
+  return &pcm_infos[i];
+}
+
+/* Returns the stream's descriptor. The fast path is a lock-free read of a
+ * completed entry; an unresolved stream is looked up under the lock and, if it
+ * still cannot be read, retried on every block at first and every 32nd after
+ * that. The dense start matters: a stream that is configured while this object
+ * is being attached settles within a few blocks, and waiting 32 blocks for the
+ * first retry is a second of silence at 64-frame blocks rather than an
+ * instant one. */
+static pcm_info* pcm_info_get(snd_pcm_t* pcm) {
+  pcm_info* pi;
+  int i;
+
+  for (i = 0; i < PCM_INFO_MAX; i++) {
+    if (pcm_infos[i].pcm == pcm &&
+        __atomic_load_n(&pcm_infos[i].resolved, __ATOMIC_ACQUIRE)) {
+      return &pcm_infos[i];
+    }
+  }
+
+  pthread_mutex_lock(&pcm_info_lock);
+  __atomic_add_fetch(&pcm_get_slow, 1, __ATOMIC_RELAXED);
+  pi = pcm_info_slot(pcm);
+  if (!__atomic_load_n(&pi->resolved, __ATOMIC_ACQUIRE)) {
+    pi->attempts++;
+    if (pi->attempts <= 64 || (pi->attempts & 31) == 0) {
+      pcm_info_from_current(pi);
+    }
+  }
+  pthread_mutex_unlock(&pcm_info_lock);
+  return pi;
+}
+
+/* Merge one field supplied by one of the parameter calls into the stream's
+ * entry. The daemon names its format, channels and rate in separate calls
+ * before installing them, and those calls carry the values as arguments -- no
+ * params object has to be readable for this to work. That matters because an
+ * unresolved stream is passed through in silence, and reading the object back
+ * (or querying the installed parameters) is the step that has failed on the
+ * instrument while the write path itself was hooked. */
+static void pcm_info_note(snd_pcm_t* pcm, int format, unsigned channels,
+                          unsigned rate) {
+  pcm_info* pi;
+
+  if (pcm == NULL) return;
+  pthread_mutex_lock(&pcm_info_lock);
+  pi = pcm_info_slot(pcm);
+  pcm_info_set(pi, format, channels, rate);
+  pthread_mutex_unlock(&pcm_info_lock);
+}
+
+/* The three setters are recorded only when they succeed, so a format the
+ * library refused is not mistaken for the one the stream has. Each passes -1
+ * or 0 for the fields it does not carry. */
+int snd_pcm_hw_params_set_format(snd_pcm_t* pcm, void* params, int format) {
+  static int (*real)(snd_pcm_t*, void*, int);
+  int rc;
+
+  if (real == NULL)
+    real = (int (*)(snd_pcm_t*, void*, int))
+        pcm_real("snd_pcm_hw_params_set_format");
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  rc = real(pcm, params, format);
+  if (rc == 0) pcm_info_note(pcm, format, 0, 0);
+  return rc;
+}
+
+int snd_pcm_hw_params_set_channels(snd_pcm_t* pcm, void* params,
+                                   unsigned channels) {
+  static int (*real)(snd_pcm_t*, void*, unsigned);
+  int rc;
+
+  if (real == NULL)
+    real = (int (*)(snd_pcm_t*, void*, unsigned))
+        pcm_real("snd_pcm_hw_params_set_channels");
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  rc = real(pcm, params, channels);
+  if (rc == 0) pcm_info_note(pcm, -1, channels, 0);
+  return rc;
+}
+
+int snd_pcm_hw_params_set_rate(snd_pcm_t* pcm, void* params, unsigned rate,
+                               int dir) {
+  static int (*real)(snd_pcm_t*, void*, unsigned, int);
+  int rc;
+
+  if (real == NULL)
+    real = (int (*)(snd_pcm_t*, void*, unsigned, int))
+        pcm_real("snd_pcm_hw_params_set_rate");
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  rc = real(pcm, params, rate, dir);
+  if (rc == 0) pcm_info_note(pcm, -1, 0, rate);
+  return rc;
+}
+
+/* The convenience API carries all three at once. A daemon that uses it does
+ * not necessarily reach the snd_pcm_hw_params interposer below as a call of
+ * its own, so this is recorded here rather than relying on that. */
+int snd_pcm_set_params(snd_pcm_t* pcm, int format, int access,
+                       unsigned channels, unsigned rate, int soft_resample,
+                       unsigned latency) {
+  static int (*real)(snd_pcm_t*, int, int, unsigned, unsigned, int, unsigned);
+  int rc;
+
+  if (real == NULL)
+    real = (int (*)(snd_pcm_t*, int, int, unsigned, unsigned, int, unsigned))
+        pcm_real("snd_pcm_set_params");
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  rc = real(pcm, format, access, channels, rate, soft_resample, latency);
+  if (rc == 0) pcm_info_note(pcm, format, channels, rate);
+  return rc;
+}
+
+/* The daemon installs the stream's shape here, and it is recorded here too.
+ *
+ * snd_pcm_hw_params_current() answers only once the parameters are installed,
+ * which is the wrong moment: a block that arrives earlier, or one failed read,
+ * used to leave the stream unresolved for the life of the process. The object
+ * passed here carries the values the daemon chose, and they are what its
+ * interleaved buffer will contain -- a plug converts after this point, not
+ * before it. These are the same values the setters above already recorded, and
+ * merging them is harmless; this call remains the authoritative confirmation
+ * whenever it can be read. The values are read before the real call because a
+ * plugin is free to rewrite the object it was handed. */
+int snd_pcm_hw_params(snd_pcm_t* pcm, void* params) {
+  static int (*real)(snd_pcm_t*, void*);
+
+  if (real == NULL)
+    real = (int (*)(snd_pcm_t*, void*))pcm_real("snd_pcm_hw_params");
+  if (pcm != NULL && params != NULL) {
+    pthread_mutex_lock(&pcm_info_lock);
+    pcm_info_from_params(pcm_info_slot(pcm), params);
+    pthread_mutex_unlock(&pcm_info_lock);
+  }
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  return real(pcm, params);
+}
+
+/* A closed stream's slot is released, so a later snd_pcm_t reusing the same
+ * address does not inherit an unrelated format. */
+int snd_pcm_close(snd_pcm_t* pcm) {
+  static int (*real)(snd_pcm_t*);
+  int i;
+
+  if (real == NULL)
+    real = (int (*)(snd_pcm_t*))pcm_real("snd_pcm_close");
+  if (pcm != NULL) {
+    pthread_mutex_lock(&pcm_info_lock);
+    for (i = 0; i < PCM_INFO_MAX; i++) {
+      if (pcm_infos[i].pcm == pcm) {
+        memset(&pcm_infos[i], 0, sizeof pcm_infos[i]);
+        break;
+      }
+    }
+    pthread_mutex_unlock(&pcm_info_lock);
+  }
+  if (real == NULL) {
+    errno = ENOSYS;
+    return -1;
+  }
+  return real(pcm);
+}
+
+static int32_t float_to_s16(float x) {
+  if (!(x == x)) return 0;                /* NaN */
+  if (x >= 1.0f) return 32767;
+  if (x <= -1.0f) return -32768;
+  return (int32_t)(x * 32767.0f);
+}
+
+static int32_t float_to_s32(float x) {
+  if (!(x == x)) return 0;
+  if (x >= 1.0f) return 2147483647;
+  if (x <= -1.0f) return -2147483647 - 1;
+  return (int32_t)(x * 2147483647.0f);
+}
+
+static int32_t float_to_s24(float x) {
+  if (!(x == x)) return 0;
+  if (x >= 1.0f) return PCM_S24_FULL_SCALE - 1;
+  if (x <= -1.0f) return -PCM_S24_FULL_SCALE;
+  return (int32_t)(x * (float)(PCM_S24_FULL_SCALE - 1));
+}
+
+/* S24_LE keeps its sample in the low three bytes of a four-byte slot. The
+ * fourth byte is padding, so it is never summed as part of the sample: the
+ * field is sign-extended out of the low three bytes first, and the sum is
+ * written back sign-extended into all four. */
+static void s24_add(unsigned char* p, int32_t add) {
+  int32_t cur = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                          ((uint32_t)p[2] << 16));
+  int64_t sum;
+
+  /* Sign-extend the 24-bit field without a left shift into the sign bit,
+   * which is undefined for 0x800000. */
+  if ((cur & 0x800000) != 0) cur -= 0x1000000;
+  sum = (int64_t)cur + (int64_t)add;
+  if (sum > PCM_S24_FULL_SCALE - 1) sum = PCM_S24_FULL_SCALE - 1;
+  if (sum < -PCM_S24_FULL_SCALE) sum = -PCM_S24_FULL_SCALE;
+  p[0] = (unsigned char)((uint64_t)sum & 0xff);
+  p[1] = (unsigned char)(((uint64_t)sum >> 8) & 0xff);
+  p[2] = (unsigned char)(((uint64_t)sum >> 16) & 0xff);
+  p[3] = (unsigned char)(((uint64_t)sum >> 24) & 0xff);
+}
+
+/* Add one chunk of the modules' stereo mix into the PCM block. For the
+ * codec's own eight-channel S24 stream the pair is added to every stereo pair
+ * (see the header comment); the other formats, which no drumlogue stream uses,
+ * keep the narrow two-channel behaviour. A mono stream gets the two averaged. */
+static void pcm_add(unsigned char* base, unsigned long frame,
+                    const pcm_info* pi, const float* mix, unsigned n) {
+  unsigned i, ch;
+  unsigned char* p = base + (size_t)frame * pi->channels * pi->bytes;
+
+  if (pi->format == PCM_FORMAT_S16_LE) {
+    int16_t* out = (int16_t*)p;
+    for (i = 0; i < n; i++) {
+      int32_t add = float_to_s16(0.5f * (mix[i * 2] + mix[i * 2 + 1]));
+      if (pi->channels > 1) {
+        for (ch = 0; ch < 2; ch++) {
+          int32_t sum = (int32_t)out[i * pi->channels + ch] +
+                        float_to_s16(mix[i * 2 + ch]);
+          if (sum > 32767) sum = 32767;
+          if (sum < -32768) sum = -32768;
+          out[i * pi->channels + ch] = (int16_t)sum;
+        }
+      } else {
+        int32_t sum = (int32_t)out[i] + add;
+        if (sum > 32767) sum = 32767;
+        if (sum < -32768) sum = -32768;
+        out[i] = (int16_t)sum;
+      }
+    }
+  } else if (pi->format == PCM_FORMAT_S32_LE) {
+    int32_t* out = (int32_t*)p;
+    for (i = 0; i < n; i++) {
+      int32_t add = float_to_s32(0.5f * (mix[i * 2] + mix[i * 2 + 1]));
+      if (pi->channels > 1) {
+        for (ch = 0; ch < 2; ch++) {
+          int64_t sum = (int64_t)out[i * pi->channels + ch] +
+                        float_to_s32(mix[i * 2 + ch]);
+          if (sum > 2147483647LL) sum = 2147483647LL;
+          if (sum < -2147483648LL) sum = -2147483648LL;
+          out[i * pi->channels + ch] = (int32_t)sum;
+        }
+      } else {
+        int64_t sum = (int64_t)out[i] + add;
+        if (sum > 2147483647LL) sum = 2147483647LL;
+        if (sum < -2147483648LL) sum = -2147483648LL;
+        out[i] = (int32_t)sum;
+      }
+    }
+  } else if (pi->format == PCM_FORMAT_FLOAT_LE) {
+    float* out = (float*)p;
+    for (i = 0; i < n; i++) {
+      if (pi->channels > 1) {
+        out[i * pi->channels] += mix[i * 2];
+        out[i * pi->channels + 1] += mix[i * 2 + 1];
+      } else {
+        out[i] += 0.5f * (mix[i * 2] + mix[i * 2 + 1]);
+      }
+    }
+  } else if (pi->format == PCM_FORMAT_S24_LE) {
+    unsigned char* out = p;
+    for (i = 0; i < n; i++) {
+      unsigned char* f = out + (size_t)i * pi->channels * 4;
+      const unsigned pairs = pi->channels / 2;
+      const int32_t mono = float_to_s24(0.5f * (mix[i * 2] + mix[i * 2 + 1]));
+
+      if (pi->channels == 1) {
+        s24_add(f, mono);
+        continue;
+      }
+      for (ch = 0; ch < pairs; ch++) {
+        s24_add(f + (size_t)ch * 8, float_to_s24(mix[i * 2]));
+        s24_add(f + (size_t)ch * 8 + 4, float_to_s24(mix[i * 2 + 1]));
+      }
+      if ((pi->channels & 1) != 0) s24_add(f + (size_t)pairs * 8, mono);
+    }
+  }
+}
+
+/* Mix the modules into a copy of the caller's block and return the copy, or
+ * return the block untouched when there is nothing to add. */
+static const void* pcm_mix(snd_pcm_t* pcm, const void* buf,
+                           unsigned long frames) {
+  pcm_info* pi;
+  size_t bytes;
+  unsigned long off;
+  unsigned long long t_start, mod_ns = 0;
+
+  /* The whole hook is timed, not just the mixing loop: the copy in and the
+   * scratch hand-over are part of what the audio thread pays, and a block
+   * that misses the period because of them would otherwise look innocent. */
+  t_start = pcm_now_ns();
+  if (buf == NULL || frames == 0 || frames > PCM_SCRATCH_FRAMES) {
+    pcm_skip_set(PCM_SKIP_BIG);
+    return buf;
+  }
+  pi = pcm_info_get(pcm);
+  /* Publish the observed shape from the handle being written, so the panel
+   * describes the playback stream and not whichever stream was configured
+   * last. It is published before the refusals below on purpose: a stream that
+   * is refused, or a module set that is empty, then still shows what the
+   * instrument's playback actually asked for. `NONE 0C` is the one reading
+   * that means nothing has been observed at all. */
+  if (pi != NULL) {
+    __atomic_store_n(&audio_pcm_format, pi->format, __ATOMIC_RELAXED);
+    __atomic_store_n(&audio_pcm_channels, pi->channels, __ATOMIC_RELAXED);
+  }
+  if (!modules_have_audio()) {
+    pcm_skip_set(PCM_SKIP_NO_MODULE);
+    return buf;
+  }
+  if (pi == NULL || pi->channels == 0 || pi->bytes == 0) {
+    pcm_skip_set(PCM_SKIP_UNRESOLVED);
+    return buf;
+  }
+
+  bytes = (size_t)frames * pi->channels * pi->bytes;
+  if (bytes > sizeof pcm_scratch) {
+    pcm_skip_set(PCM_SKIP_BIG);
+    return buf;
+  }
+  {
+    const unsigned long long now = pcm_now_ms();
+    if (__atomic_exchange_n(&pcm_scratch_busy, 1, __ATOMIC_ACQ_REL) != 0) {
+      /* A second writer, or an owner that never came back. A live owner clears
+       * the flag inside the same block; one that has held it for a second is
+       * gone (the daemon has one playback thread), and leaving it set would
+       * silence the module for the rest of the run. */
+      const unsigned long long held =
+          __atomic_load_n(&pcm_scratch_stamp, __ATOMIC_RELAXED);
+      if (now - held <= 1000) {
+        pcm_skip_set(PCM_SKIP_BUSY);
+        return buf;
+      }
+      __atomic_add_fetch(&pcm_scratch_steals, 1, __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&pcm_scratch_stamp, now, __ATOMIC_RELAXED);
+  }
+
+  memcpy(pcm_scratch, buf, bytes);
+  for (off = 0; off < frames; off += AUDIO_CHUNK) {
+    const unsigned n = (frames - off > AUDIO_CHUNK)
+                           ? AUDIO_CHUNK
+                           : (unsigned)(frames - off);
+    float mix[AUDIO_CHUNK * 2];
+    unsigned long long a;
+    memset(mix, 0, n * 2 * sizeof(float));
+    a = pcm_now_ns();
+    modules_audio(mix, n);
+    mod_ns += pcm_now_ns() - a;
+    pcm_add(pcm_scratch, off, pi, mix, n);
+  }
+  {
+    const unsigned long long total = pcm_now_ns() - t_start;
+    __atomic_store_n(&pcm_mix_ns_last, total, __ATOMIC_RELAXED);
+    pcm_note_max(&pcm_mix_ns_max, total);
+    __atomic_store_n(&pcm_mod_ns_last, mod_ns, __ATOMIC_RELAXED);
+    pcm_note_max(&pcm_mod_ns_max, mod_ns);
+  }
+  __atomic_store_n(&pcm_scratch_busy, 0, __ATOMIC_RELEASE);
+  pcm_skip_set(PCM_SKIP_NONE);
+  __atomic_add_fetch(&audio_mixed, 1, __ATOMIC_RELAXED);
+  return pcm_scratch;
+}
 
 long snd_pcm_writei(snd_pcm_t* pcm, const void* buf, unsigned long frames) {
   static long (*real)(snd_pcm_t*, const void*, unsigned long);
   if (real == NULL) real = (long (*)(snd_pcm_t*, const void*, unsigned long))
-      dlsym(RTLD_NEXT, "snd_pcm_writei");
+      pcm_real("snd_pcm_writei");
   if (real == NULL) {
     errno = ENOSYS;
     return -1;
   }
   {
-    const long got = real(pcm, buf, frames);
-    audio_calls++;
-    if (got < 0) audio_errors++;
+    const long got = real(pcm, pcm_mix(pcm, buf, frames), frames);
+    __atomic_add_fetch(&audio_calls, 1, __ATOMIC_RELAXED);
+    if (got < 0) {
+      __atomic_add_fetch(&audio_errors, 1, __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_write_err, (int)got, __ATOMIC_RELAXED);
+    }
     return got;
   }
 }
@@ -1757,15 +2703,34 @@ long snd_pcm_mmap_writei(snd_pcm_t* pcm, const void* buf, unsigned long frames) 
   static long (*real)(snd_pcm_t*, const void*, unsigned long);
   if (real == NULL)
     real = (long (*)(snd_pcm_t*, const void*, unsigned long))
-        dlsym(RTLD_NEXT, "snd_pcm_mmap_writei");
+        pcm_real("snd_pcm_mmap_writei");
   if (real == NULL) {
     errno = ENOSYS;
     return -1;
   }
   {
-    const long got = real(pcm, buf, frames);
-    audio_calls++;
-    if (got < 0) audio_errors++;
+    const long got = real(pcm, pcm_mix(pcm, buf, frames), frames);
+    __atomic_add_fetch(&audio_calls, 1, __ATOMIC_RELAXED);
+    if (got < 0) {
+      __atomic_add_fetch(&audio_errors, 1, __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_write_err, (int)got, __ATOMIC_RELAXED);
+    }
     return got;
   }
 }
+
+#ifdef BORG_AUDIO_PROBE
+/* Test-only, deliberately absent from the shipped object: the same numbers the
+ * STATUS page draws, for a harness that drives this object against a real
+ * libasound without a panel. Built with -DBORG_AUDIO_PROBE. */
+int borg_audio_probe(int* format, unsigned* channels, unsigned long* mixed,
+                     unsigned long* calls) {
+  if (format != NULL)
+    *format = __atomic_load_n(&audio_pcm_format, __ATOMIC_RELAXED);
+  if (channels != NULL)
+    *channels = __atomic_load_n(&audio_pcm_channels, __ATOMIC_RELAXED);
+  if (mixed != NULL) *mixed = __atomic_load_n(&audio_mixed, __ATOMIC_RELAXED);
+  if (calls != NULL) *calls = __atomic_load_n(&audio_calls, __ATOMIC_RELAXED);
+  return 0;
+}
+#endif

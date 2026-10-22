@@ -33,7 +33,10 @@ static const borg_module hello_module = {
   NULL,
   NULL,
   NULL,
-  NULL
+  NULL,
+  NULL,  /* audio_render (ABI 4) */
+  NULL,  /* midi_msg (ABI 4) */
+  NULL   /* midi_transform (ABI 5) */
 };
 
 const borg_module* borg_module_entry(uint32_t host_abi) {

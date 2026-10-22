@@ -1215,7 +1215,10 @@ const borg_module storage_module = {
   storage_page_enter,
   storage_page_leave,
   storage_key,
-  storage_encoder
+  storage_encoder,
+  nullptr,  // audio_render (ABI 4)
+  nullptr,  // midi_msg (ABI 4)
+  nullptr   // midi_transform (ABI 5)
 };
 
 }  // namespace

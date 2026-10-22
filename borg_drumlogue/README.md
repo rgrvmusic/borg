@@ -47,12 +47,19 @@ daemon runs with the object, every showing of the unit reads ACTIVE until a
 power cycle, including after a program reload. The marker is only believed when
 it names the unit's own process, so a stale marker cannot hide the ready state.
 
+**A replaced `borg.drmlgunit` does nothing to a daemon that is already active.**
+GateOn is ignored, and the object the daemon is running was staged in `/tmp`
+at the switch and is not read again. Replacing the unit takes effect only after
+a power cycle, then load and GateOn as usual. `.borgmodule` files are the other
+way round: they are read when the menu opens, so a replaced module does apply
+to a running daemon.
+
 
 ## Extensions
 
-The loaded object adds a status menu, a MIDI note transform and a
-`.borgmodule` loader to the running daemon. None of them starts a process or a
-thread; they run in the daemon's own process.
+The loaded object adds a status menu, a MIDI transform for `.borgmodule` to
+use, and a `.borgmodule` loader to the running daemon. None of them starts a
+process or a thread; they run in the daemon's own process.
 
 ### Status menu
 
@@ -69,8 +76,8 @@ pages and the sequencer views reopen with their own content intact.
 
 | Tab | Shows |
 |---|---|
-| STATUS | daemon pid, uptime, audio calls, audio xruns and menu opens |
-| MIDI | MIDI bytes in and out, messages and notes, the last note, transpose and velocity |
+| STATUS | daemon pid, uptime, blocks mixed per audio write, the recorded stream shape and xruns (a `MIXED/CALLS:` with a letter names why nothing was mixed) |
+| MIDI | MIDI bytes in and out, messages and notes, the last note, and the name of the loaded transform module (or `NONE`) |
 
 The menu draws over the daemon's screen, and the daemon's last screen is
 restored when it closes. Both chord presses are held back, so opening the menu
@@ -79,15 +86,26 @@ still delivered, in order; every other key and the lamps behave as before.
 
 ### MIDI note transform
 
-Incoming notes can be transposed and note-on velocity scaled:
+The note transform is a module, `transform.borgmodule`, not a setting of the
+loaded object. There is no environment variable: the daemon is started by the
+instrument's own init before anything could set one, and borg's re-exec carries
+that same environment, so a variable for it was unreachable in practice. The
+module has a page of its own with the two controls:
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `LOGUE_BORG_MIDI_TRANSPOSE` | `0` | semitones added to every note, clamped to 0 to 127 |
-| `LOGUE_BORG_MIDI_VELOCITY` | `100` | note-on velocity as a percentage, 1 to 200 |
+| Encoder | Sets |
+|---|---|
+| 1 | transpose, -24 to +24 semitones |
+| 2 | note-on velocity, 5 to 200 percent |
 
-The variables are read when the object loads. Real-time messages, system
-exclusive data and running status are passed through unchanged.
+Transpose moves note-on and note-off alike, so the right voice is released;
+velocity 0 on `0x9n` stays a note-off and is not scaled up. The defaults are 0
+and 100 percent, which pass every message through unchanged. The STATUS page's
+MIDI tab (`XFORM:`) names the module when one is loaded.
+
+The capability is `BORG_CAP_MIDI_TRANSFORM` (ABI 5): the message is still the
+daemon's copy and the data bytes are writable, so the transform happens before
+the daemon's own unit plays the note and before any `MIDI_EVENTS` module sees
+it. See [modules/transform](../modules/transform/README.md).
 
 ### Modules
 
@@ -144,15 +162,94 @@ cannot trap the user. While a page asks for input it takes every encoder; the
 daemon's page underneath does not see them. The callbacks run on the panel
 thread.
 
-The callbacks are serialized by the host, so a module needs no lock of its own.
-It still must not create a process or a thread, and it must stay silent about
-messages that are not its own: it is offered the traffic of every other device
-on every port.
+ABI 4 appends audio and channel MIDI. A module that asks for `BORG_CAP_AUDIO`
+is given a block on the daemon's playback path; one that asks for
+`BORG_CAP_MIDI_EVENTS` is offered every complete channel message before the
+daemon's own unit sees it:
+
+| Field | Meaning |
+|---|---|
+| `audio_render(out, frames)` | add into a zeroed interleaved stereo float block |
+| `midi_msg(port, data, n)` | one channel message, status byte through its data bytes |
+| host `samplerate` | the playback stream's rate, or 0 until one has been seen |
+
+`audio_render` is the one callback the host does not serialize, because it runs
+on the audio thread and cannot wait. It must not block, allocate, take a lock,
+call a host service, or touch anything the panel or MIDI thread may be changing
+without an atomic. The host calls it in blocks of at most 64 frames, so a unit
+that caps its own render at 64 is safe, and mixes the result into whatever PCM
+format the daemon opened (S16, S24, S32 or float, mono or stereo). **The
+drumlogue opens the pcm3168a codec at S24_LE with eight channels**, and the
+daemon's own mix is duplicated across those outputs, so a module's stereo pair
+is added to every stereo pair in the block: which pair reaches the jack is not
+visible from inside the daemon.
+
+The stream's shape is recorded from every call the daemon makes to describe it
+(`snd_pcm_hw_params_set_format`, `..._set_channels`, `..._set_rate`,
+`snd_pcm_set_params`, and the installation itself in `snd_pcm_hw_params`), so
+it is known before the first block. Those calls carry the values as arguments
+and need nothing read back. Reading the installed parameters back with
+`snd_pcm_hw_params_current` is a second, retried fallback for a stream that was
+configured before this object was preloaded. A read that fails is not
+remembered — latching one failure is how the mix once went silent for the rest
+of a run while the call counter kept rising. A stream in a format or shape this
+code cannot convert is passed through untouched.
+
+Both the recorded format and the number of blocks actually mixed are on the
+STATUS page (`PCM/XRUNS:` and `MIXED/CALLS:`). When calls rise but nothing is
+mixed, `MIXED/CALLS:` gains one letter naming the reason, and the same reason
+is written once to `borg-modules.log`:
+
+| Letter | Reason |
+|---|---|
+| `n` | no loaded module asks for audio |
+| `u` | the stream's format is not resolved |
+| `b` | another block holds the scratch buffer |
+| `s` | the block is larger than the scratch buffer |
+| `x` | neither write entry point was entered at all |
+
+`PCM/XRUNS:` names the shape of the handle being written: `S24 8C/0` is
+S24_LE, eight channels, no xruns. A format this code cannot convert is shown
+by its numeric id (`F5 8C/0`) rather than as `NONE`, so the instrument's own
+stream can be identified from the panel. `NONE 0C` means no write has reached
+the hook yet, which with `x` on the row below is the signature of a playback
+path this object is not on.
+
+A module with nothing to add leaves the buffer alone. `samplerate` is written
+before the first audio block; `init` may still see 0, which should be treated as
+48000 — the drumlogue's fixed rate.
+
+`midi_msg` runs on the MIDI thread, serialized with the other callbacks. Its
+`n` is 2 or 3; running status has already been assembled, realtime bytes have
+been dropped, and any `BORG_CAP_MIDI_TRANSFORM` module has already had the
+message, so a module hears the notes the daemon's own unit hears. System
+messages are not offered — SysEx remains `midi_in`. `port` is the same opaque
+handle `midi_in` receives.
+
+`midi_transform` is the same message one step earlier, with writable data
+bytes and before the daemon's unit. It is the only callback that can change
+what the instrument plays. Transform modules run in load order and before every
+`midi_msg`. ABI 5 adds it as `BORG_CAP_MIDI_TRANSFORM`:
+
+| Field | Meaning |
+|---|---|
+| `midi_transform(port, data, n)` | one channel message; the data bytes are writable, the status byte is not |
+
+`transform.borgmodule` is the working example: transpose and velocity scaling,
+with both settings on its own page.
+
+`BORG_PATH_UNITS` names the daemon's `Units/Synths` directory, so a module can
+load a `.drmlgunit` of its own without hardcoding the userfs path.
+
+The callbacks are serialized by the host, except `audio_render`, so a module
+needs no lock of its own for the others. It still must not create a process or
+a thread, and it must stay silent about messages that are not its own: it is
+offered the traffic of every other device on every port.
 
 The host reads `abi` first and never reads past the layout that ABI names.
 Fields are only appended, never reordered or removed. `init` receives the host
-services (log, module path, text, dark text, row, and in ABI 2 the two MIDI
-calls) and the module's own path. A module may draw its page but not clear the
+services (log, the path selector, text, dark text, row, in ABI 2 the two MIDI
+calls, and in ABI 4 `samplerate`) and the module's own path. A module may draw its page but not clear the
 screen. `row` has a 12-character label column and a 12-character value column;
 use `text` for longer lines. The panel stops drawing a text run at a comma, so
 use a space instead.

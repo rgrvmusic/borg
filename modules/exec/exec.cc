@@ -1549,7 +1549,10 @@ const borg_module exec_module = {
   nullptr,
   nullptr,
   nullptr,
-  nullptr
+  nullptr,
+  nullptr,  // audio_render (ABI 4)
+  nullptr,  // midi_msg (ABI 4)
+  nullptr   // midi_transform (ABI 5)
 };
 
 }  // namespace
