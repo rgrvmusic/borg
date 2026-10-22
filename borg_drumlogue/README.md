@@ -195,6 +195,27 @@ remembered — latching one failure is how the mix once went silent for the rest
 of a run while the call counter kept rising. A stream in a format or shape this
 code cannot convert is passed through untouched.
 
+### Scheduling
+
+The daemon starts its playback thread at the default policy — `SCHED_OTHER` at
+nice 0 — so on the instrument it competes on equal terms with the panel thread,
+MIDI, and the threaded IRQs of a PREEMPT_RT kernel. The drumlogue's stream has
+four 64-frame periods (5.3 ms) of buffer, and an EPIPE there means the audio
+thread did not run for longer than that, while this hook's whole cost is tens
+of microseconds. Borg therefore measures, over the first 256 blocks, how much
+CPU the audio thread uses per cycle:
+
+- **under three quarters** — the thread is being descheduled, and it is moved
+  to `SCHED_FIFO` at 50, the priority a PREEMPT_RT kernel gives its threaded
+  IRQs, so no ordinary thread can take the core away for a timeslice;
+- **over that** — the core is genuinely full, and the priority is left alone,
+  because raising it would only take the panel's share.
+
+The decision, the sample it was taken from, and the resulting policy are one
+line in `/tmp/logue-borg-audio.log` (`scheduling:`). A playback loop that
+busy-waits out its deadline spends the whole cycle either way, so the ratio
+does not depend on what the instrument happens to be playing.
+
 Both the recorded format and the number of blocks actually mixed are on the
 STATUS page (`PCM/XRUNS:` and `MIXED/CALLS:`). When calls rise but nothing is
 mixed, `MIXED/CALLS:` gains one letter naming the reason, and the same reason
@@ -385,10 +406,17 @@ That report goes to userfs because a dead daemon forces a power cycle and
 dies.
 
 `/tmp/logue-borg-audio.log` is the opposite case. It is written on the panel
-thread, never the audio thread, at most every ten seconds, and on the first
-occurrence of each fault: the mix time against the 667 µs a 32-frame write owns,
-the module's share of it, xruns and the negative return of the last failed
-write. It lives in tmpfs deliberately — a diagnostic that writes to flash every
+thread, never the audio thread, at most every ten seconds, and on the first four
+xruns: the hook's time and the module's share of it, the gap between the
+previous write's return and the next hook entry (the daemon's own work for the
+block), the time spent inside the library's write, the stream's buffer and
+period read back from the handle, and the same block again in the audio
+thread's **CPU** time — the one number that separates an overworked core from
+a thread that was not running. The hook's time alone does not decide an xrun:
+the block has to be produced before the buffer runs dry, so it is the gap plus
+the mix that has to fit, and the buffer is measured rather than assumed. It
+lives in tmpfs
+deliberately — a diagnostic that writes to flash every
 few seconds wears out the instrument it is diagnosing. Read it while the daemon
 is alive (`@exec cat /tmp/logue-borg-audio.log`); the crash report above is the
 part that survives.

@@ -154,6 +154,57 @@ static unsigned long pcm_get_slow;
 static int pcm_write_err;               /* last negative writei return */
 static unsigned pcm_frames_last;        /* frames in the last mixed write */
 
+/* The hook's own cost is not the question that decides an xrun. On this board
+ * the daemon renders its own unit between two writes, and that block has to be
+ * produced before the buffer runs dry: the deadline is the buffer's worth of
+ * audio minus what was just written, and it is spent by the daemon's engine,
+ * this hook and the library's write together. `pcm_gap_ns_*` is the time from
+ * the previous write's return to the next hook entry, which is the daemon's own
+ * per-block work; `pcm_write_ns_*` is the time inside the library call. Only
+ * with all three is a mix time of 60 us either innocent or damning.
+ *
+ * `pcm_buffer_frames`/`pcm_period_frames` are the stream's real shape, read
+ * back once from the handle the daemon writes: the log's old "667 us a 32-frame
+ * write owns" was an assumption, and the observed writes are 64 frames, so the
+ * slack has to come from the handle and not from a comment. */
+static unsigned long long pcm_prev_ret_ns;      /* audio thread only */
+static unsigned long long pcm_gap_ns_last, pcm_gap_ns_max;
+static unsigned long long pcm_write_ns_last, pcm_write_ns_max;
+/* The block that missed, captured on the audio thread at the failure. */
+static unsigned long long pcm_err_gap_ns, pcm_err_mix_ns, pcm_err_mod_ns;
+static unsigned pcm_buffer_frames, pcm_period_frames;
+
+/* Wall time cannot tell a block that was expensive from one that was merely
+ * scheduled late, and the call is lateness that matters: with a four-period
+ * buffer an xrun means the audio thread did not run for 5.3 ms, while this
+ * hook's whole cost is tens of microseconds. So the same block is also timed
+ * with the calling thread's CPU clock. The difference between the two -- CPU
+ * consumed per audio cycle -- separates an instrument whose core is genuinely
+ * full from one whose audio thread is being descheduled, and the scheduling
+ * decision below is taken from it rather than from a guess. */
+static unsigned long long pcm_prev_in_wall, pcm_prev_in_cpu;
+static unsigned long long pcm_prev_hook_cpu, pcm_prev_write_cpu;
+static unsigned long long pcm_engine_cpu_ns, pcm_engine_cpu_max;
+static unsigned long long pcm_hook_cpu_ns, pcm_hook_cpu_max;
+static unsigned long long pcm_cycle_ns;
+enum {
+  PCM_RT_UNDECIDED = 0,
+  PCM_RT_FIFO,      /* the audio thread was promoted and is the one that runs */
+  PCM_RT_CFS,       /* the core is already full; leaving it alone is right */
+  PCM_RT_REFUSED    /* no permission to change it */
+};
+static int pcm_rt_state;
+static unsigned long long pcm_rt_cpu_us, pcm_rt_cycle_us;
+
+/* What scheduling each of the two threads runs under, recorded once. A hook
+ * whose own work is tens of microseconds cannot miss a 1333 us period by
+ * itself; it misses when it is not the highest-priority thing on the core, and
+ * whether that is true is a fact about the daemon's threads that no amount of
+ * timing the hook will show. The panel thread is the one this object adds work
+ * to, so its priority is the other half of the question. */
+static int pcm_audio_policy = -1, pcm_audio_prio;
+static int pcm_panel_policy = -1, pcm_panel_prio;
+
 /* Where the audio thread is when the counters stop. A frozen MIXED/CALLS has
  * three causes that look identical from the counts alone: the daemon stopped
  * calling the hook (between blocks or gone), a module's render never returned,
@@ -180,6 +231,19 @@ static const char* pcm_stage_name(int stage) {
     case PCM_STAGE_MODULE: return "module render";
     case PCM_STAGE_WRITE: return "driver write";
     default: return "no write entered";
+  }
+}
+
+/* A scheduling policy as one word, for a log line. The numbers are the
+ * kernel's and are not portable, which is why they are not printed. */
+static const char* sched_name(int policy) {
+  switch (policy) {
+    case -1: return "?";
+    case SCHED_FIFO: return "fifo";
+    case SCHED_RR: return "rr";
+    case SCHED_BATCH: return "batch";
+    case SCHED_IDLE: return "idle";
+    default: return "other";
   }
 }
 
@@ -1219,6 +1283,22 @@ static void audio_diag_log(void) {
       __atomic_load_n(&pcm_mix_ns_max, __ATOMIC_RELAXED) / 1000;
   const unsigned long slow = __atomic_load_n(&pcm_get_slow, __ATOMIC_RELAXED);
 
+  /* Once, on the panel thread: its scheduling next to the audio thread's, which
+   * is recorded in pcm_mix. */
+  {
+    static int done;
+    if (!done) {
+      struct sched_param sp;
+      int policy = SCHED_OTHER;
+
+      done = 1;
+      if (pthread_getschedparam(pthread_self(), &policy, &sp) == 0) {
+        __atomic_store_n(&pcm_panel_policy, policy, __ATOMIC_RELAXED);
+        __atomic_store_n(&pcm_panel_prio, sp.sched_priority, __ATOMIC_RELAXED);
+      }
+    }
+  }
+
   /* Keep the fault reporter's object map current, so an address in a unit that
    * dlsynth loaded after startup can still be named. Every two seconds, on the
    * panel thread; the loader lock is not touched on the audio thread. */
@@ -1244,16 +1324,31 @@ static void audio_diag_log(void) {
                __atomic_load_n(&pcm_mod_ns_max, __ATOMIC_RELAXED) / 1000,
                __atomic_load_n(&pcm_frames_last, __ATOMIC_RELAXED));
   }
-  /* The first xrun, with the numbers at that moment. Once only: a run with
-   * hundreds of them must not turn the log into load. */
-  if (errors != 0 && logged_errors == 0) {
+  /* The first few xruns, each with the block that missed. One line was not
+   * enough: the first xrun of a run can be the load's own artefact, and the
+   * ones that follow while the user plays are the question. Four lines and
+   * then quiet -- a run with hundreds must not turn the log into load. The gap
+   * is the daemon's own work for that block, so gap + mix is the time that had
+   * to fit the buffer, and a mix of 60 us next to a gap of 1200 us says the
+   * module was not the reason. */
+  if (errors != logged_errors) {
+    static unsigned logged_xruns;
+
     logged_errors = errors;
-    audio_logf("first xrun: write returned %d; mix %llu us (module %llu us), "
-               "max %llu us; %lu mixed/%lu writes",
-               __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED),
-               __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED) / 1000,
-               __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED) / 1000,
-               max_us, mixed, calls);
+    if (logged_xruns < 4) {
+      logged_xruns++;
+      audio_logf("xrun %lu: write returned %d; gap %llu us + mix %llu us "
+                 "(module %llu us) had to fit a %u-frame buffer; previous "
+                 "cycle cpu engine %llu us of %llu us; %lu mixed/%lu writes",
+                 errors, __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED),
+                 __atomic_load_n(&pcm_err_gap_ns, __ATOMIC_RELAXED) / 1000,
+                 __atomic_load_n(&pcm_err_mix_ns, __ATOMIC_RELAXED) / 1000,
+                 __atomic_load_n(&pcm_err_mod_ns, __ATOMIC_RELAXED) / 1000,
+                 __atomic_load_n(&pcm_buffer_frames, __ATOMIC_RELAXED),
+                 __atomic_load_n(&pcm_engine_cpu_ns, __ATOMIC_RELAXED) / 1000,
+                 __atomic_load_n(&pcm_cycle_ns, __ATOMIC_RELAXED) / 1000, mixed,
+                 calls);
+    }
   }
   /* A retried parameter read means the shape came from the fallback, which is
    * slower and is the path that once lost the stream entirely. */
@@ -1290,6 +1385,25 @@ static void audio_diag_log(void) {
     }
   }
 
+  /* The one-time scheduling decision, with the sample it was taken from. A
+   * decision without its numbers cannot be argued with, and this one changes
+   * how the daemon's own thread is scheduled. */
+  {
+    static int logged;
+    const int rt = __atomic_load_n(&pcm_rt_state, __ATOMIC_RELAXED);
+
+    if (rt != PCM_RT_UNDECIDED && !logged) {
+      logged = 1;
+      audio_logf("scheduling: audio thread %s; it used %llu us of a %llu us "
+                 "cycle over the first 256",
+                 rt == PCM_RT_FIFO
+                     ? "promoted to fifo 50"
+                     : (rt == PCM_RT_REFUSED ? "fifo refused"
+                                             : "left in cfs"),
+                 __atomic_load_n(&pcm_rt_cpu_us, __ATOMIC_RELAXED),
+                 __atomic_load_n(&pcm_rt_cycle_us, __ATOMIC_RELAXED));
+    }
+  }
   /* The periodic line only while audio is actually moving: a daemon with no
    * playback is not a daemon whose mix time anyone needs, and ten seconds of
    * nothing is still a write. */
@@ -1300,13 +1414,36 @@ static void audio_diag_log(void) {
   }
   if (diag_ms != 0 && pcm_now_ms() - diag_ms < 10000) return;
   diag_ms = pcm_now_ms();
-  audio_logf("mix %llu us (module %llu us) per %u frames, max %llu us; "
-             "%lu mixed/%lu writes, %lu xruns, last write %d, %lu slow gets",
-             __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED) / 1000,
-             __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED) / 1000,
-             __atomic_load_n(&pcm_frames_last, __ATOMIC_RELAXED), max_us, mixed,
-             calls, errors,
-             __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED), slow);
+  {
+    static unsigned long last_errors;
+    const unsigned long added = errors - last_errors;
+
+    last_errors = errors;
+    audio_logf("mix %llu us (module %llu us), gap %llu us, write %llu us max "
+               "%llu/%llu, per %u frames of %u/%u (buffer/period); cpu hook "
+               "%llu us, engine %llu us (max %llu) of a %llu us cycle; "
+               "%lu mixed/%lu writes, %lu xruns (+%lu), last write %d, "
+               "%lu slow gets; audio %s/%d, panel %s/%d",
+               __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_gap_ns_last, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_write_ns_last, __ATOMIC_RELAXED) / 1000,
+               max_us,
+               __atomic_load_n(&pcm_write_ns_max, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_frames_last, __ATOMIC_RELAXED),
+               __atomic_load_n(&pcm_buffer_frames, __ATOMIC_RELAXED),
+               __atomic_load_n(&pcm_period_frames, __ATOMIC_RELAXED),
+               __atomic_load_n(&pcm_hook_cpu_ns, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_engine_cpu_ns, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_engine_cpu_max, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_cycle_ns, __ATOMIC_RELAXED) / 1000, mixed,
+               calls, errors, added,
+               __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED), slow,
+               sched_name(__atomic_load_n(&pcm_audio_policy, __ATOMIC_RELAXED)),
+               __atomic_load_n(&pcm_audio_prio, __ATOMIC_RELAXED),
+               sched_name(__atomic_load_n(&pcm_panel_policy, __ATOMIC_RELAXED)),
+               __atomic_load_n(&pcm_panel_prio, __ATOMIC_RELAXED));
+  }
 }
 
 static void menu_draw(void) {
@@ -2517,6 +2654,29 @@ static void* pcm_real(const char* name) {
   return p;
 }
 
+/* The stream's real slack, read once from the handle being written. A 64-frame
+ * write does not own 1333 us of deadline: it owns whatever the buffer has not
+ * already promised the hardware. Asking the handle costs one call at the first
+ * block and removes the guess. */
+static void pcm_note_budget(snd_pcm_t* pcm) {
+  static int queried;
+  static int (*get_params)(snd_pcm_t*, unsigned long*, unsigned long*);
+
+  if (queried) return;
+  queried = 1;
+  if (get_params == NULL)
+    get_params = (int (*)(snd_pcm_t*, unsigned long*, unsigned long*))
+        pcm_real("snd_pcm_get_params");
+  if (get_params != NULL) {
+    unsigned long buffer = 0, period = 0;
+
+    if (get_params(pcm, &buffer, &period) == 0) {
+      __atomic_store_n(&pcm_buffer_frames, (unsigned)buffer, __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_period_frames, (unsigned)period, __ATOMIC_RELAXED);
+    }
+  }
+}
+
 /* Plain dlsym() is the modern ABI here, and that was measured rather than
  * assumed: on the device's own libasound, dlsym()'s default
  * snd_pcm_hw_params_get_format writes its out-parameter and returns 0, while
@@ -2565,6 +2725,18 @@ static unsigned long long pcm_now_ns(void) {
          (unsigned long long)ts.tv_nsec;
 }
 
+/* How much CPU the calling thread has actually used. This is a syscall on
+ * armhf rather than a vDSO read, which is why it is taken three times per
+ * block and never in a loop. A failure is reported as 0 and the accounting is
+ * skipped, so a kernel without the clock costs the numbers and not the audio. */
+static unsigned long long pcm_cpu_ns(void) {
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+  return (unsigned long long)ts.tv_sec * 1000000000ULL +
+         (unsigned long long)ts.tv_nsec;
+}
+
 /* A maximum written from the audio thread and read from the panel thread.
  * compare_exchange rather than a load/store pair so two writers cannot lose
  * the larger value. */
@@ -2575,6 +2747,94 @@ static void pcm_note_max(unsigned long long* slot, unsigned long long value) {
          !__atomic_compare_exchange_n(slot, &cur, value, 0, __ATOMIC_RELAXED,
                                       __ATOMIC_RELAXED)) {
   }
+}
+
+/* Decide, once, whether the playback thread should be given real-time
+ * scheduling -- from measurement rather than from policy.
+ *
+ * On the drumlogue with a second synth hosted, this thread ran SCHED_OTHER at
+ * nice 0 while everything else on the instrument competed with it on equal
+ * terms: the panel thread, MIDI, and on a PREEMPT_RT kernel the threaded IRQs.
+ * The stream has four 64-frame periods (5.3 ms) of buffer, so an EPIPE means
+ * the thread did not run for longer than that, and none of the hook's own tens
+ * of microseconds can explain it.
+ *
+ * Which answer is right depends on one number: the CPU the thread consumes per
+ * cycle. A thread that is idle for much of a cycle is being descheduled, and
+ * SCHED_FIFO at 50 -- the priority a PREEMPT_RT kernel gives its threaded IRQs
+ * -- stops every ordinary thread from taking the core away for a timeslice. A
+ * thread already burning most of the cycle means a full core, where raising
+ * the priority would only take the remaining share from the panel, so it is
+ * left alone. A loop that busy-waits out its deadline spends the whole cycle
+ * either way, so the ratio distinguishes the two without knowing what runs
+ * between the writes.
+ *
+ * The sample is the first 256 cycles, before a module is usually loaded, and
+ * that is deliberate: a busy-wait is a property of the loop and is present at
+ * any load, so an idle instrument gives the same answer as a playing one.
+ */
+static void pcm_rt_maybe(unsigned long long cpu, unsigned long long cycle) {
+  static unsigned long long cpu_sum, cycle_sum;
+  static unsigned samples;
+
+  if (__atomic_load_n(&pcm_rt_state, __ATOMIC_RELAXED) != PCM_RT_UNDECIDED) {
+    return;
+  }
+  cpu_sum += cpu;
+  cycle_sum += cycle;
+  if (++samples < 256) return;
+
+  __atomic_store_n(&pcm_rt_cpu_us, cpu_sum / samples / 1000, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcm_rt_cycle_us, cycle_sum / samples / 1000,
+                   __ATOMIC_RELAXED);
+  /* Three quarters of the cycle, on the average over the sample. */
+  if (4 * cpu_sum < 3 * cycle_sum) {
+    struct sched_param sp;
+    int policy = SCHED_OTHER;
+    int state = PCM_RT_REFUSED;
+
+    if (pthread_getschedparam(pthread_self(), &policy, &sp) == 0 &&
+        policy != SCHED_OTHER) {
+      /* Already real-time: something above this object set it. Leave it. */
+      state = PCM_RT_FIFO;
+    } else {
+      sp.sched_priority = 50;
+      if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
+        state = PCM_RT_FIFO;
+      }
+    }
+    __atomic_store_n(&pcm_rt_state, state, __ATOMIC_RELAXED);
+  } else {
+    __atomic_store_n(&pcm_rt_state, PCM_RT_CFS, __ATOMIC_RELAXED);
+  }
+}
+
+/* The end of one hook entry, after the library's write returned. `t_in` and
+ * `t_cpu` are the two clocks taken at entry; the hook and the write have timed
+ * their own CPU in between, and what is left of the cycle is the daemon's own
+ * work for the block. */
+static void pcm_block_cpu(unsigned long long t_in, unsigned long long t_cpu,
+                          unsigned long long cpu_hook,
+                          unsigned long long cpu_write) {
+  if (t_cpu == 0) return;
+  if (pcm_prev_in_cpu != 0 && t_cpu > pcm_prev_in_cpu &&
+      t_in > pcm_prev_in_wall) {
+    const unsigned long long cycle = t_in - pcm_prev_in_wall;
+    const unsigned long long used = t_cpu - pcm_prev_in_cpu;
+    const unsigned long long accounted = pcm_prev_hook_cpu + pcm_prev_write_cpu;
+    const unsigned long long engine = used > accounted ? used - accounted : 0;
+
+    __atomic_store_n(&pcm_engine_cpu_ns, engine, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_cycle_ns, cycle, __ATOMIC_RELAXED);
+    pcm_note_max(&pcm_engine_cpu_max, engine);
+    pcm_rt_maybe(used, cycle);
+  }
+  __atomic_store_n(&pcm_hook_cpu_ns, cpu_hook, __ATOMIC_RELAXED);
+  pcm_note_max(&pcm_hook_cpu_max, cpu_hook);
+  pcm_prev_in_wall = t_in;
+  pcm_prev_in_cpu = t_cpu;
+  pcm_prev_hook_cpu = cpu_hook;
+  pcm_prev_write_cpu = cpu_write;
 }
 
 static void pcm_skip_set(int reason) {
@@ -3013,8 +3273,15 @@ static const void* pcm_mix(snd_pcm_t* pcm, const void* buf,
   {
     static int alt_installed;
     if (!alt_installed) {
+      struct sched_param sp;
+      int policy = SCHED_OTHER;
+
       alt_installed = 1;
       crash_altstack(crash_stack_audio, sizeof crash_stack_audio);
+      if (pthread_getschedparam(pthread_self(), &policy, &sp) == 0) {
+        __atomic_store_n(&pcm_audio_policy, policy, __ATOMIC_RELAXED);
+        __atomic_store_n(&pcm_audio_prio, sp.sched_priority, __ATOMIC_RELAXED);
+      }
     }
   }
 
@@ -3039,6 +3306,7 @@ static const void* pcm_mix(snd_pcm_t* pcm, const void* buf,
   if (pi != NULL) {
     __atomic_store_n(&audio_pcm_format, pi->format, __ATOMIC_RELAXED);
     __atomic_store_n(&audio_pcm_channels, pi->channels, __ATOMIC_RELAXED);
+    pcm_note_budget(pcm);
   }
   if (!modules_have_audio()) {
     pcm_skip_set(PCM_SKIP_NO_MODULE);
@@ -3123,21 +3391,49 @@ long snd_pcm_writei(snd_pcm_t* pcm, const void* buf, unsigned long frames) {
     return -1;
   }
   {
-    const void* mixed = pcm_mix(pcm, buf, frames);
+    const unsigned long long t_in = pcm_now_ns();
+    const unsigned long long t_cpu = pcm_cpu_ns();
+    const unsigned long long prev =
+        __atomic_load_n(&pcm_prev_ret_ns, __ATOMIC_RELAXED);
+    const unsigned long long gap = prev != 0 ? t_in - prev : 0;
+    unsigned long long t_write, t_done, t_cpu_write, cpu_hook, cpu_write;
+    const void* mixed;
     long got;
+
+    if (prev != 0) {
+      __atomic_store_n(&pcm_gap_ns_last, gap, __ATOMIC_RELAXED);
+      pcm_note_max(&pcm_gap_ns_max, gap);
+    }
+    mixed = pcm_mix(pcm, buf, frames);
+    cpu_hook = pcm_cpu_ns() - t_cpu;
 
     /* The stage is set between the two calls on purpose: the mix has returned,
      * so a block reported as WRITE is one the library is holding, not one of
      * ours. That is the difference between a slow module and a dead stream. */
     __atomic_store_n(&pcm_stage, PCM_STAGE_WRITE, __ATOMIC_RELAXED);
-    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+    t_write = pcm_now_ns();
+    t_cpu_write = pcm_cpu_ns();
+    __atomic_store_n(&pcm_beat_ms, t_write / 1000000, __ATOMIC_RELAXED);
     got = real(pcm, mixed, frames);
+    t_done = pcm_now_ns();
+    cpu_write = pcm_cpu_ns() - t_cpu_write;
     __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
-    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_beat_ms, t_done / 1000000, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_prev_ret_ns, t_done, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_write_ns_last, t_done - t_write, __ATOMIC_RELAXED);
+    pcm_note_max(&pcm_write_ns_max, t_done - t_write);
+    pcm_block_cpu(t_in, t_cpu, cpu_hook, cpu_write);
     __atomic_add_fetch(&audio_calls, 1, __ATOMIC_RELAXED);
     if (got < 0) {
       __atomic_add_fetch(&audio_errors, 1, __ATOMIC_RELAXED);
       __atomic_store_n(&pcm_write_err, (int)got, __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_err_gap_ns, gap, __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_err_mix_ns,
+                       __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED),
+                       __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_err_mod_ns,
+                       __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED),
+                       __ATOMIC_RELAXED);
     }
     return got;
   }
@@ -3153,18 +3449,46 @@ long snd_pcm_mmap_writei(snd_pcm_t* pcm, const void* buf, unsigned long frames) 
     return -1;
   }
   {
-    const void* mixed = pcm_mix(pcm, buf, frames);
+    const unsigned long long t_in = pcm_now_ns();
+    const unsigned long long t_cpu = pcm_cpu_ns();
+    const unsigned long long prev =
+        __atomic_load_n(&pcm_prev_ret_ns, __ATOMIC_RELAXED);
+    const unsigned long long gap = prev != 0 ? t_in - prev : 0;
+    unsigned long long t_write, t_done, t_cpu_write, cpu_hook, cpu_write;
+    const void* mixed;
     long got;
 
+    if (prev != 0) {
+      __atomic_store_n(&pcm_gap_ns_last, gap, __ATOMIC_RELAXED);
+      pcm_note_max(&pcm_gap_ns_max, gap);
+    }
+    mixed = pcm_mix(pcm, buf, frames);
+    cpu_hook = pcm_cpu_ns() - t_cpu;
+
     __atomic_store_n(&pcm_stage, PCM_STAGE_WRITE, __ATOMIC_RELAXED);
-    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+    t_write = pcm_now_ns();
+    t_cpu_write = pcm_cpu_ns();
+    __atomic_store_n(&pcm_beat_ms, t_write / 1000000, __ATOMIC_RELAXED);
     got = real(pcm, mixed, frames);
+    t_done = pcm_now_ns();
+    cpu_write = pcm_cpu_ns() - t_cpu_write;
     __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
-    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_beat_ms, t_done / 1000000, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_prev_ret_ns, t_done, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_write_ns_last, t_done - t_write, __ATOMIC_RELAXED);
+    pcm_note_max(&pcm_write_ns_max, t_done - t_write);
+    pcm_block_cpu(t_in, t_cpu, cpu_hook, cpu_write);
     __atomic_add_fetch(&audio_calls, 1, __ATOMIC_RELAXED);
     if (got < 0) {
       __atomic_add_fetch(&audio_errors, 1, __ATOMIC_RELAXED);
       __atomic_store_n(&pcm_write_err, (int)got, __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_err_gap_ns, gap, __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_err_mix_ns,
+                       __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED),
+                       __ATOMIC_RELAXED);
+      __atomic_store_n(&pcm_err_mod_ns,
+                       __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED),
+                       __ATOMIC_RELAXED);
     }
     return got;
   }
