@@ -206,10 +206,18 @@ of microseconds. Borg therefore measures, over the first 256 blocks, how much
 CPU the audio thread uses per cycle:
 
 - **under three quarters** — the thread is being descheduled, and it is moved
-  to `SCHED_FIFO` at 50, the priority a PREEMPT_RT kernel gives its threaded
-  IRQs, so no ordinary thread can take the core away for a timeslice;
+  to `SCHED_FIFO` at priority 1, the lowest real-time priority, so no ordinary
+  thread can take the core away for a timeslice while every threaded IRQ and
+  driver thread the kernel created still outranks it;
 - **over that** — the core is genuinely full, and the priority is left alone,
   because raising it would only take the panel's share.
+
+Priority 1 is not a timid default. At 50 — where a PREEMPT_RT kernel puts its
+threaded IRQs — the promotion was measured on the board to starve the I/O the
+instrument needs: the display and the sequencer LEDs went irregular as soon as
+the audio thread had work, and exec replies over USB MIDI stopped arriving
+altogether. The protection that is wanted is against *ordinary* threads, and
+that is what 1 gives.
 
 The decision, the sample it was taken from, and the resulting policy are one
 line in `/tmp/logue-borg-audio.log` (`scheduling:`). A playback loop that

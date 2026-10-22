@@ -1397,7 +1397,7 @@ static void audio_diag_log(void) {
       audio_logf("scheduling: audio thread %s; it used %llu us of a %llu us "
                  "cycle over the first 256",
                  rt == PCM_RT_FIFO
-                     ? "promoted to fifo 50"
+                     ? "promoted to fifo 1"
                      : (rt == PCM_RT_REFUSED ? "fifo refused"
                                              : "left in cfs"),
                  __atomic_load_n(&pcm_rt_cpu_us, __ATOMIC_RELAXED),
@@ -2761,13 +2761,20 @@ static void pcm_note_max(unsigned long long* slot, unsigned long long value) {
  *
  * Which answer is right depends on one number: the CPU the thread consumes per
  * cycle. A thread that is idle for much of a cycle is being descheduled, and
- * SCHED_FIFO at 50 -- the priority a PREEMPT_RT kernel gives its threaded IRQs
- * -- stops every ordinary thread from taking the core away for a timeslice. A
- * thread already burning most of the cycle means a full core, where raising
- * the priority would only take the remaining share from the panel, so it is
- * left alone. A loop that busy-waits out its deadline spends the whole cycle
- * either way, so the ratio distinguishes the two without knowing what runs
- * between the writes.
+ * SCHED_FIFO stops every ordinary thread from taking the core away for a
+ * timeslice. A thread already burning most of the cycle means a full core,
+ * where raising the priority would only take the remaining share from the
+ * panel, so it is left alone. A loop that busy-waits out its deadline spends
+ * the whole cycle either way, so the ratio distinguishes the two without
+ * knowing what runs between the writes.
+ *
+ * The priority is 1, the lowest real-time one, deliberately. At 50 -- where a
+ * PREEMPT_RT kernel's threaded IRQs sit -- this was measured on the drumlogue
+ * to starve the I/O the instrument needs: the panel and the sequencer LEDs went
+ * irregular whenever the audio thread had work, and exec replies over USB MIDI
+ * stopped coming back entirely. Every driver thread the kernel created outranks
+ * 1 and keeps the precedence it was given; what changes is only that the
+ * playback thread is no longer scheduled as an ordinary thread.
  *
  * The sample is the first 256 cycles, before a module is usually loaded, and
  * that is deliberate: a busy-wait is a property of the loop and is present at
@@ -2798,7 +2805,7 @@ static void pcm_rt_maybe(unsigned long long cpu, unsigned long long cycle) {
       /* Already real-time: something above this object set it. Leave it. */
       state = PCM_RT_FIFO;
     } else {
-      sp.sched_priority = 50;
+      sp.sched_priority = 1;
       if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
         state = PCM_RT_FIFO;
       }
