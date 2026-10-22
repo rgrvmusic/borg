@@ -130,6 +130,11 @@ static char g_dir[DLSYNTH_DIR_MAX];
 static dlsynth_entry g_list[DLSYNTH_LIST_MAX];
 static int g_count;
 static int g_selected = -1;
+/* The index that is actually open. Not `g_selected`: the encoder moves the
+ * highlight, and the loaded unit keeps playing until MASTER takes the new
+ * selection. The startup init sets it so MASTER can tell "already open, just
+ * open the gate" from "load this one now". */
+static int g_loaded = -1;
 
 static unsigned g_channel = 1;
 static char g_state[DLSYNTH_NAME_MAX + 1] = "NO UNIT";
@@ -626,6 +631,7 @@ copy_fail:
 }
 
 static void close_unit(void) {
+  g_loaded = -1;
   if (g_unit.handle == NULL) return;
   g_unit.ready = 0;
   if (g_unit.suspend != NULL) g_unit.suspend();
@@ -759,7 +765,13 @@ static int audio_stop(void) {
   return -1;
 }
 
-static void load_index(int index) {
+/* Bring one unit up on the panel thread. `live` opens the audio gate when the
+ * unit is ready; the startup call leaves it closed, so the copy out of flash,
+ * the dlopen, the relocations, unit_init and the warm-up render all happen
+ * before the instrument is played rather than in the block that MASTER would
+ * otherwise interrupt. That work is milliseconds of I/O and page faults, and
+ * doing it with the engine rendering is heard as crackle at the key press. */
+static void start_unit(int index, int live) {
   char err[64];
 
   if (index < 0 || index >= g_count) {
@@ -767,7 +779,7 @@ static void load_index(int index) {
     return;
   }
   if (audio_stop() != 0) {
-    __atomic_store_n(&g_audio_on, 1, __ATOMIC_SEQ_CST);
+    if (live) __atomic_store_n(&g_audio_on, 1, __ATOMIC_SEQ_CST);
     set_state("BUSY");
     dlog("dlsynth: audio busy, not switching");
     return;
@@ -788,14 +800,38 @@ static void load_index(int index) {
     set_state(err);
     dlog("dlsynth: %s: %s", g_list[index].file, err);
   } else {
-    set_state("READY");
     g_selected = index;
-    dlog("dlsynth: loaded %s (%.13s) on channel %u, %u Hz",
-         g_list[index].file, g_unit.header->name, g_channel,
-         (unsigned)(g_host->samplerate != 0 ? g_host->samplerate
-                                            : DLSYNTH_DEFAULT_RATE));
+    g_loaded = index;
+    set_state(live ? "READY" : "STANDBY");
+    if (live) {
+      dlog("dlsynth: loaded %s (%.13s) on channel %u, %u Hz",
+           g_list[index].file, g_unit.header->name, g_channel,
+           (unsigned)(g_host->samplerate != 0 ? g_host->samplerate
+                                              : DLSYNTH_DEFAULT_RATE));
+    } else {
+      dlog("dlsynth: initialised %s (%.13s) for channel %u, %u Hz; "
+           "MASTER starts it",
+           g_list[index].file, g_unit.header->name, g_channel,
+           (unsigned)(g_host->samplerate != 0 ? g_host->samplerate
+                                              : DLSYNTH_DEFAULT_RATE));
+    }
   }
-  __atomic_store_n(&g_audio_on, 1, __ATOMIC_SEQ_CST);
+  if (live) __atomic_store_n(&g_audio_on, 1, __ATOMIC_SEQ_CST);
+}
+
+static void load_index(int index) {
+  /* The selected unit is already initialised when MASTER is pressed: that is
+   * the startup init doing its job. Starting playback must not repeat any of
+   * it, or the panel hands the audio thread the interruption the startup init
+   * exists to avoid. */
+  if (index == g_loaded &&
+      __atomic_load_n(&g_unit.ready, __ATOMIC_ACQUIRE)) {
+    g_idle_blocks = 0;
+    __atomic_store_n(&g_audio_on, 1, __ATOMIC_SEQ_CST);
+    set_state("READY");
+    return;
+  }
+  start_unit(index, 1);
 }
 
 /* ------------------------------------------------------------- the callbacks */
@@ -973,16 +1009,23 @@ static int dlsynth_init(const borg_host* host, const char* module_path) {
 
   dlog("dlsynth: %d synth unit(s) in %s, channel %u", g_count, g_dir,
        g_channel);
-  /* Do not start a unit just because the module was installed. The directory
-   * may hold a sample-based unit, and this module supplies no sample banks;
-   * such a unit can fault on its first render. A name in the environment is an
-   * explicit choice, and MASTER is the same choice made on the panel. */
+  /* Initialise the selected unit here, at module init, not when MASTER is
+   * pressed. The daemon paints as soon as it is up, so this runs before the
+   * user plays; the copy, the dlopen, unit_init and the warm-up render are
+   * then off the path of a key press made while the engine is rendering. The
+   * audio gate stays closed, so an initialised unit neither renders nor
+   * receives events until MASTER; installing the module alone produces no
+   * sound.
+   *
+   * A name in LOGUE_BORG_DLSYNTH_UNIT is explicit: if it matches nothing, no
+   * other unit is initialised in its place, because a page the user did not
+   * ask for is indistinguishable from a broken module. */
   if (g_count == 0) {
     set_state("NO SYNTH");
-  } else if (wanted_found) {
-    load_index(g_selected);
-  } else {
+  } else if (wanted != NULL && *wanted != '\0' && !wanted_found) {
     set_state("NO UNIT");
+  } else {
+    start_unit(g_selected, 0);
   }
   return 0;
 }

@@ -58,8 +58,9 @@ the menu opens, so a module added while the daemon runs appears after MUTE and
 MASTER are pressed again. A load failure is written to
 `userfs/Programs/borg-modules.log`.
 
-The page is the last tab. PAGE DOWN reaches it, encoder 1 chooses a unit, and
-MASTER loads it.
+The page is the last tab. PAGE DOWN reaches it and encoder 1 chooses a unit.
+The selected unit is initialised when the module starts, before the instrument
+is played; MASTER puts it on the mix.
 
 ## The page
 
@@ -67,7 +68,7 @@ MASTER loads it.
 |---|---|
 | `UNIT:` | the selected unit's display name from its header |
 | `CHANNEL:` | the MIDI channel it listens on, 1 to 16 |
-| `STATE:` | `READY`, `LOADING`, a failure reason, `NO SYNTH`, `NO DIR`, `BUSY`, or `NO UNIT`, followed by the last rendered block's peak as a percentage |
+| `STATE:` | `STANDBY`, `READY`, `LOADING`, a failure reason, `NO SYNTH`, `NO DIR`, `BUSY`, or `NO UNIT`, followed by the last rendered block's peak as a percentage |
 | `REND/US:` | render calls made by the host since the unit was loaded, then the **unit's own render** in microseconds at its worst |
 
 `REND/US:` and the peak exist to answer two questions from the panel. Whether
@@ -87,7 +88,10 @@ only report that survives a daemon wedged in the audio path.
   here is an open/write/close on userfs flash **per detent**, and on this board
   that write is long enough to miss the next 1.33 ms audio block — which is
   heard as the channel change itself crackling.
-- **MASTER** loads the selected unit.
+- **MASTER** starts the selected unit. If it is the one initialised at startup
+  it becomes audible immediately, with no flash read, no `dlopen` and no
+  `unit_init`; `STATE:` goes from `STANDBY` to `READY`. A different selection is
+  loaded at that point.
 
 The list holds only `.drmlgunit` files whose ELF header names the drumlogue
 **synth** target (`0x405`). An effect, a delay or a master effect is never
@@ -127,14 +131,19 @@ Read at module init:
 | `LOGUE_BORG_DLSYNTH_UNIT` | file name, file stem or header display name to load at start; otherwise the first sorted entry |
 
 These are useful for a test tree and for choosing a unit without the panel.
-**Nothing is started on install alone.** A name in `LOGUE_BORG_DLSYNTH_UNIT` is
-an explicit choice and is loaded during init; otherwise the highlighted unit is
-loaded when MASTER is pressed. That distinction matters because the directory
-can hold sample-based units, and this module supplies no sample banks (see
-below): a crash caused by opening a page the user had not asked for would be
-indistinguishable from a broken module. The panel does not persist its choices:
-a restart returns to the environment, and no unit is loaded unless the variable
-names one.
+**The selected unit is initialised during module init, not when MASTER is
+pressed.** The copy out of userfs flash, the `dlopen`, `unit_init` and a
+warm-up render happen while the instrument is still idle; the audio gate stays
+closed, so the unit neither renders nor receives events until MASTER. Any other
+selection chosen afterwards is loaded at MASTER. The panel does not persist its
+choices: a restart returns to the environment, or to the first sorted entry
+when the variable is unset.
+
+Because the first sorted entry is opened even when it was not meant to be
+used, and this module supplies no sample banks (see below), name an oscillator
+unit in `LOGUE_BORG_DLSYNTH_UNIT` when the directory holds a sample-based unit
+that sorts first. A name that matches nothing is refused rather than
+substituted, so an explicit choice never turns into a different unit.
 
 ## Why the unit is copied to /tmp
 
@@ -203,7 +212,8 @@ and every oscillator unit tested here behaves that way.
   declared defaults are pushed after `unit_init` and are not exposed on the
   panel. The unit's own front panel is not available either.
 - **No persistence.** The page selection and channel are in memory only, and
-  after a restart no unit is loaded unless `LOGUE_BORG_DLSYNTH_UNIT` names one.
+  after a restart the startup selection is initialised again from the
+  environment (or the first sorted entry) and stands by until MASTER.
 - **Not yet verified through the instrument's codec.** The functional test loads
   a real `Tesseract_synth.drmlgunit` under qemu-arm and checks the synth filter
   against a mixed directory and an effects-only one, plus channel filtering and
