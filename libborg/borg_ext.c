@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -33,6 +34,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "borg_module.h"
@@ -150,6 +152,36 @@ static unsigned long long pcm_mix_ns_last, pcm_mix_ns_max;
 static unsigned long long pcm_mod_ns_last, pcm_mod_ns_max;
 static unsigned long pcm_get_slow;
 static int pcm_write_err;               /* last negative writei return */
+static unsigned pcm_frames_last;        /* frames in the last mixed write */
+
+/* Where the audio thread is when the counters stop. A frozen MIXED/CALLS has
+ * three causes that look identical from the counts alone: the daemon stopped
+ * calling the hook (between blocks or gone), a module's render never returned,
+ * or the library's own write never returned. The audio thread publishes which
+ * one it is in and when it last entered the hook, so the panel can name it --
+ * and the panel is the only report that survives a daemon too wedged to answer
+ * MIDI, which is exactly the state that made this necessary. `pcm_stage_mod`
+ * is the module whose `audio_render` is running. All three are written by the
+ * audio thread and read by the panel thread, so atomics, relaxed: they are a
+ * diagnostic, not a synchronisation. */
+enum {
+  PCM_STAGE_IDLE = 0,   /* not in the hook: between blocks */
+  PCM_STAGE_HOOK,       /* copying, converting, or adding the mix */
+  PCM_STAGE_MODULE,     /* inside a module's audio_render */
+  PCM_STAGE_WRITE       /* inside the library's own write */
+};
+static int pcm_stage;
+static int pcm_stage_mod;
+static unsigned long long pcm_beat_ms;
+
+static const char* pcm_stage_name(int stage) {
+  switch (stage) {
+    case PCM_STAGE_HOOK: return "host copy/mix";
+    case PCM_STAGE_MODULE: return "module render";
+    case PCM_STAGE_WRITE: return "driver write";
+    default: return "no write entered";
+  }
+}
 
 /* Defined with the audio path below; the STATUS page reports its numbers. */
 static unsigned long long pcm_now_ms(void);
@@ -191,8 +223,222 @@ static void raw_log(const char* path, const char* line) {
   syscall(SYS_close, fd);
 }
 
+/* ------------------------------------------------------------ fault reporting
+ *
+ * `drumlogued` installs no SIGSEGV or SIGBUS handler, and bootarbiterd starts
+ * it once with nothing to restart it. A bad pointer anywhere inside the daemon
+ * -- including inside a unit it hosts -- therefore takes the whole instrument
+ * down and leaves no line anywhere. That is indistinguishable from a hang or a
+ * power problem, and it is exactly what a report like "it cracked, then the
+ * machine died, no log" describes.
+ *
+ * This installs the handler. It writes the signal, the PC, LR, SP and the
+ * faulting address and then re-raises with the default action, so the daemon
+ * still dies the way it would have -- nothing is swallowed, nothing continues
+ * in an unknown state. The object map is refreshed from the panel thread so the
+ * address can be named: the daemon, a borg module, or the private copy dlsynth
+ * made of a unit.
+ *
+ * This is the one diagnostic written to userfs, and the reason is the crash it
+ * reports: a dead daemon forces a power cycle, and /tmp is tmpfs, so a line
+ * kept there would be wiped along with the fault it describes. One line, only
+ * when the process is already dying -- not a stream, and not a wear question. */
+#define BORG_CRASH_LOG \
+  "/var/lib/drumlogued/userfs/Programs/borg-crash.log"
+#define CRASH_OBJECTS_MAX 16
+
+typedef struct {
+  unsigned long base;
+  unsigned long end;
+  char name[32];
+} crash_object;
+
+static crash_object crash_objects[CRASH_OBJECTS_MAX];
+static int crash_object_count;
+
+static void crash_object_note(unsigned long base, unsigned long end,
+                              const char* name) {
+  int i;
+
+  if (base == 0 || crash_object_count >= CRASH_OBJECTS_MAX) return;
+  for (i = 0; i < crash_object_count; i++) {
+    if (crash_objects[i].base == base) return;
+  }
+  crash_objects[crash_object_count].base = base;
+  crash_objects[crash_object_count].end = end;
+  snprintf(crash_objects[crash_object_count].name,
+           sizeof crash_objects[crash_object_count].name, "%s", name);
+  __atomic_store_n(&crash_object_count, crash_object_count + 1,
+                   __ATOMIC_RELEASE);
+}
+
+static int crash_phdr(struct dl_phdr_info* info, size_t size, void* data) {
+  unsigned long end = 0;
+  int i;
+  const char* name;
+
+  (void)size;
+  (void)data;
+  for (i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+    if (ph->p_type != PT_LOAD) continue;
+    if (info->dlpi_addr + ph->p_vaddr + ph->p_memsz > end) {
+      end = info->dlpi_addr + ph->p_vaddr + ph->p_memsz;
+    }
+  }
+  name = info->dlpi_name;
+  if (name == NULL || name[0] == '\0') {
+    name = "drumlogued";
+  } else {
+    const char* slash = strrchr(name, '/');
+    if (slash != NULL && slash[1] != '\0') name = slash + 1;
+  }
+  crash_object_note(info->dlpi_addr, end, name);
+  return 0;
+}
+
+/* Named from the panel thread at 2 Hz: cheap enough there, and never called
+ * from the audio thread or from the handler, which must not take the loader
+ * lock. */
+static void crash_refresh(void) { dl_iterate_phdr(crash_phdr, NULL); }
+
+static int crash_hex(char* out, unsigned long v) {
+  static const char digits[] = "0123456789abcdef";
+  char tmp[2 * sizeof(unsigned long)];
+  int i = 0, n = 0;
+
+  if (v == 0) {
+    out[n++] = '0';
+    return n;
+  }
+  while (v != 0) {
+    tmp[i++] = digits[v & 0xf];
+    v >>= 4;
+  }
+  while (i > 0) out[n++] = tmp[--i];
+  return n;
+}
+
+static void crash_handler(int sig, siginfo_t* si, void* uc_) {
+  static volatile sig_atomic_t entered;
+  ucontext_t* uc = (ucontext_t*)uc_;
+  unsigned long pc = 0, lr = 0, sp = 0;
+  const char* pc_name = "?";
+  const char* lr_name = "?";
+  char line[192];
+  int n = 0, i, count;
+  int fd;
+
+  /* A fault while reporting a fault: give up and let the default happen. */
+  if (entered) {
+    signal(sig, SIG_DFL);
+    raise(sig);
+    return;
+  }
+  entered = 1;
+
+#if defined(__arm__)
+  pc = (unsigned long)uc->uc_mcontext.arm_pc;
+  lr = (unsigned long)uc->uc_mcontext.arm_lr;
+  sp = (unsigned long)uc->uc_mcontext.arm_sp;
+#else
+  (void)uc;
+#endif
+  count = __atomic_load_n(&crash_object_count, __ATOMIC_ACQUIRE);
+  for (i = 0; i < count; i++) {
+    const crash_object* o = &crash_objects[i];
+    if (pc >= o->base && pc < o->end) pc_name = o->name;
+    if (lr >= o->base && lr < o->end) lr_name = o->name;
+  }
+
+  /* Hand-rolled formatting: snprintf is not async-signal-safe, and this runs
+   * on whichever thread faulted -- usually the audio one. */
+#define CRASH_LIT(s)                                                       \
+  do {                                                                     \
+    const char* s_ = (s);                                                  \
+    while (*s_ != '\0' && n < (int)sizeof line - 1) line[n++] = *s_++;     \
+  } while (0)
+#define CRASH_HEX(v)                                                       \
+  do {                                                                     \
+    if (n < (int)sizeof line - 1) line[n++] = '0';                         \
+    if (n < (int)sizeof line - 1) line[n++] = 'x';                         \
+    n += crash_hex(line + n, (unsigned long)(v));                          \
+    if (n > (int)sizeof line - 1) n = (int)sizeof line - 1;                \
+  } while (0)
+#define CRASH_STR(s)                                                       \
+  do {                                                                     \
+    const char* s_ = (s);                                                  \
+    while (*s_ != '\0' && n < (int)sizeof line - 2) line[n++] = *s_++;     \
+  } while (0)
+
+  CRASH_LIT("borg: signal ");
+  if (sig >= 10) line[n++] = (char)('0' + (sig / 10) % 10);
+  line[n++] = (char)('0' + sig % 10);
+  CRASH_LIT(" pc=");
+  CRASH_HEX(pc);
+  CRASH_LIT(" in ");
+  CRASH_STR(pc_name);
+  CRASH_LIT(" lr=");
+  CRASH_HEX(lr);
+  CRASH_LIT(" in ");
+  CRASH_STR(lr_name);
+  CRASH_LIT(" sp=");
+  CRASH_HEX(sp);
+  CRASH_LIT(" addr=");
+  CRASH_HEX(si != NULL ? (unsigned long)si->si_addr : 0);
+#undef CRASH_LIT
+#undef CRASH_HEX
+#undef CRASH_STR
+  line[n++] = '\n';
+
+  fd = (int)syscall(SYS_openat, AT_FDCWD, BORG_CRASH_LOG,
+                    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+  if (fd >= 0) {
+    raw_write(fd, line, (size_t)n);
+    syscall(SYS_close, fd);
+  }
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+/* If the fault is a stack overflow, the handler cannot run on the stack that
+ * just overflowed. Each thread that runs daemon or unit code gets an alternate
+ * signal stack of its own: the panel thread and the audio thread, which are
+ * the only two that can be inside a unit. Shared buffers would be wrong if
+ * both faulted at once; two faults at once is not a state worth designing for,
+ * but two threads are the real case, so each gets its own. */
+static unsigned char crash_stack_audio[16384];
+static unsigned char crash_stack_panel[16384];
+
+static void crash_altstack(unsigned char* buf, size_t n) {
+  stack_t ss;
+
+  ss.ss_sp = buf;
+  ss.ss_size = n;
+  ss.ss_flags = 0;
+  sigaltstack(&ss, NULL);
+}
+
+static void crash_install(void) {
+  static const int signals[] = {SIGSEGV, SIGBUS, SIGFPE, SIGILL};
+  struct sigaction sa;
+  size_t i;
+
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = crash_handler;
+  sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  /* The object map is refreshed from the panel thread, not here: this runs
+   * during dynamic linking, and dl_iterate_phdr takes the loader lock. Address
+   * names are a convenience; the handler still reports every address. */
+  for (i = 0; i < sizeof signals / sizeof signals[0]; i++) {
+    sigaction(signals[i], &sa, NULL);
+  }
+}
+
 __attribute__((constructor)) static void borg_ext_init(void) {
   start_epoch = time(NULL);
+  crash_install();
 }
 
 /* ---------------------------------------------------------------- the panel */
@@ -906,8 +1152,161 @@ static void modules_audio(float* out, uint32_t frames) {
         m->audio_render == NULL) {
       continue;
     }
+    /* Published before the call, so a render that never returns is named on
+     * the panel instead of only showing as a frozen block counter. */
+    __atomic_store_n(&pcm_stage_mod, i, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_stage, PCM_STAGE_MODULE, __ATOMIC_RELAXED);
     m->audio_render(out, frames);
   }
+  __atomic_store_n(&pcm_stage, PCM_STAGE_HOOK, __ATOMIC_RELAXED);
+}
+
+/* Audio diagnostics go to /tmp, which is tmpfs: RAM. The instrument's userfs
+ * is flash, and a line every few seconds is a line every few seconds for as
+ * long as the daemon runs -- exactly the shape of write that wears a card out.
+ * A diagnostic must not damage the instrument it is diagnosing. The file is
+ * capped so a long session cannot eat the RAM either.
+ *
+ * The other half of the same concern: this is written from the panel thread at
+ * most every ten seconds, never from the audio thread, and never per block. */
+#define BORG_AUDIO_LOG "/tmp/logue-borg-audio.log"
+#define BORG_AUDIO_LOG_MAX 65536UL
+
+static unsigned long audio_log_bytes;
+
+static void audio_logf(const char* fmt, ...) {
+  char msg[256];
+  char line[320];
+  va_list ap;
+
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof msg, fmt, ap);
+  va_end(ap);
+  snprintf(line, sizeof line, "borg audio: %s\n", msg);
+  if (audio_log_bytes > BORG_AUDIO_LOG_MAX) {
+    const int fd =
+        (int)syscall(SYS_openat, AT_FDCWD, BORG_AUDIO_LOG,
+                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) syscall(SYS_close, fd);
+    audio_log_bytes = 0;
+  }
+  raw_log(BORG_AUDIO_LOG, line);
+  audio_log_bytes += strlen(line);
+}
+
+/* The audio path's health, written from the panel thread whether or not the
+ * menu is open -- a run that crackles while the user plays has the menu
+ * closed, and a report from that run used to carry no numbers at all.
+ *
+ * A ten-second line plus the first occurrence of each fault is the whole
+ * budget. `last write` is the negative return of the most recent failed
+ * write: -EPIPE is the deadline missed, anything else is a different story. */
+static void audio_diag_log(void) {
+  static unsigned long long diag_ms;
+  static int logged_format = -2;
+  static unsigned logged_channels;
+  static unsigned long logged_errors;
+  static int logged_budget;
+  static int logged_slow;
+  const int format = __atomic_load_n(&audio_pcm_format, __ATOMIC_RELAXED);
+  const unsigned channels =
+      __atomic_load_n(&audio_pcm_channels, __ATOMIC_RELAXED);
+  const unsigned long mixed = __atomic_load_n(&audio_mixed, __ATOMIC_RELAXED);
+  const unsigned long calls = __atomic_load_n(&audio_calls, __ATOMIC_RELAXED);
+  const unsigned long errors =
+      __atomic_load_n(&audio_errors, __ATOMIC_RELAXED);
+  const unsigned long long max_us =
+      __atomic_load_n(&pcm_mix_ns_max, __ATOMIC_RELAXED) / 1000;
+  const unsigned long slow = __atomic_load_n(&pcm_get_slow, __ATOMIC_RELAXED);
+
+  /* Keep the fault reporter's object map current, so an address in a unit that
+   * dlsynth loaded after startup can still be named. Every two seconds, on the
+   * panel thread; the loader lock is not touched on the audio thread. */
+  {
+    static unsigned long long refresh_ms;
+    if (pcm_now_ms() - refresh_ms >= 2000) {
+      refresh_ms = pcm_now_ms();
+      crash_refresh();
+    }
+  }
+
+  if (format >= 0 && channels > 0 &&
+      (format != logged_format || channels != logged_channels)) {
+    logged_format = format;
+    logged_channels = channels;
+    audio_logf("mixing %s %u ch, %lu mixed of %lu writes",
+               pcm_format_name(format), channels, mixed, calls);
+  }
+  /* The first block that went over half the 667 us a 32-frame write owns. */
+  if (!logged_budget && max_us >= 500) {
+    logged_budget = 1;
+    audio_logf("mix peaked at %llu us (module %llu us) per %u frames", max_us,
+               __atomic_load_n(&pcm_mod_ns_max, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_frames_last, __ATOMIC_RELAXED));
+  }
+  /* The first xrun, with the numbers at that moment. Once only: a run with
+   * hundreds of them must not turn the log into load. */
+  if (errors != 0 && logged_errors == 0) {
+    logged_errors = errors;
+    audio_logf("first xrun: write returned %d; mix %llu us (module %llu us), "
+               "max %llu us; %lu mixed/%lu writes",
+               __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED),
+               __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED) / 1000,
+               __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED) / 1000,
+               max_us, mixed, calls);
+  }
+  /* A retried parameter read means the shape came from the fallback, which is
+   * slower and is the path that once lost the stream entirely. */
+  if (!logged_slow && slow != 0) {
+    logged_slow = 1;
+    audio_logf("%lu slow parameter gets (fallback path)", slow);
+  }
+  /* A stalled audio thread is the one failure that has no other report: the
+   * daemon can be wedged inside a unit's render or inside the library's own
+   * write, and the read that would fetch this file is on one of the same
+   * threads. One line per episode, and the same stage on the STATUS page while
+   * it lasts, which is the report that survives a wedged daemon. */
+  {
+    static int stalled_logged;
+    const unsigned long long beat =
+        __atomic_load_n(&pcm_beat_ms, __ATOMIC_RELAXED);
+    const unsigned long long now = pcm_now_ms();
+    const int stalled = calls > 0 && beat != 0 && now - beat > 2000;
+
+    if (!stalled) {
+      stalled_logged = 0;
+    } else if (!stalled_logged) {
+      const int stage = __atomic_load_n(&pcm_stage, __ATOMIC_RELAXED);
+      const int skip = __atomic_load_n(&pcm_skip, __ATOMIC_RELAXED);
+      stalled_logged = 1;
+      audio_logf("audio stalled for %llu ms in %s (stage %d, module %d); "
+                 "%lu mixed/%lu writes, last write %d, %lu xruns, %lu skips, "
+                 "last skip %s",
+                 now - beat, pcm_stage_name(stage), stage,
+                 __atomic_load_n(&pcm_stage_mod, __ATOMIC_RELAXED), mixed,
+                 calls, __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED),
+                 errors, __atomic_load_n(&pcm_skips, __ATOMIC_RELAXED),
+                 skip != PCM_SKIP_NONE ? pcm_skip_name(skip) : "none");
+    }
+  }
+
+  /* The periodic line only while audio is actually moving: a daemon with no
+   * playback is not a daemon whose mix time anyone needs, and ten seconds of
+   * nothing is still a write. */
+  {
+    static unsigned long last_calls;
+    if (calls == last_calls) return;
+    last_calls = calls;
+  }
+  if (diag_ms != 0 && pcm_now_ms() - diag_ms < 10000) return;
+  diag_ms = pcm_now_ms();
+  audio_logf("mix %llu us (module %llu us) per %u frames, max %llu us; "
+             "%lu mixed/%lu writes, %lu xruns, last write %d, %lu slow gets",
+             __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED) / 1000,
+             __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED) / 1000,
+             __atomic_load_n(&pcm_frames_last, __ATOMIC_RELAXED), max_us, mixed,
+             calls, errors,
+             __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED), slow);
 }
 
 static void menu_draw(void) {
@@ -1014,6 +1413,16 @@ static void menu_draw(void) {
       const unsigned channels =
           __atomic_load_n(&audio_pcm_channels, __ATOMIC_RELAXED);
       const int skip = __atomic_load_n(&pcm_skip, __ATOMIC_RELAXED);
+      const unsigned long long beat =
+          __atomic_load_n(&pcm_beat_ms, __ATOMIC_RELAXED);
+      const unsigned long long now = pcm_now_ms();
+      /* Two seconds without a block is not a slow block: the longest one this
+       * instrument can be asked for is 1333 us. Anything past that is a thread
+       * that is not coming back, and the stage says which one. This is the
+       * only report available when the same wedge takes the MIDI thread with
+       * it, which is exactly what happened on the board. */
+      const int stalled = calls > 0 && beat != 0 && now - beat > 2000;
+      const int stage = __atomic_load_n(&pcm_stage, __ATOMIC_RELAXED);
 
       /* A block that is entered but not mixed is the failure this page exists
        * to make visible: the call counter rises, the modules hear MIDI, and
@@ -1043,57 +1452,30 @@ static void menu_draw(void) {
       }
       menu_row(44, "MIXED/CALLS:", value);
 
-      /* One line the first time a shape is actually mixed into, so a report
-       * from the instrument says which path resolved the stream rather than
-       * leaving it to be inferred from the panel. Written on the panel thread:
-       * the audio path must not do file I/O. */
-      {
-        static int logged_format = -1;
-        static unsigned logged_channels;
-        if (format >= 0 && channels > 0 &&
-            (format != logged_format || channels != logged_channels)) {
-          logged_format = format;
-          logged_channels = channels;
-          module_logf("audio: mixing %s %u ch, %lu mixed of %lu writes",
-                      pcm_format_name(format), channels, mixed, calls);
+      if (stalled) {
+        /* The stage number is the whole point: 0 means no write has been
+         * entered since the daemon stopped, 1 is this hook, 2 is a module's
+         * render (named by M<n>), 3 is the library's own write. The words are
+         * in /tmp/logue-borg-audio.log, which a wedged daemon cannot serve. */
+        if (stage == PCM_STAGE_MODULE) {
+          snprintf(value, sizeof value, "S%d M%d", stage,
+                   __atomic_load_n(&pcm_stage_mod, __ATOMIC_RELAXED));
+        } else {
+          snprintf(value, sizeof value, "S%d", stage);
         }
-      }
-
-      /* Where the audio thread's time went. Written every two seconds while
-       * this page is open, so a run that crackles says whether the mix is
-       * anywhere near the 1333 us a 64-frame block allows, and whether the
-       * module's render is the whole of it. `last write` is the negative
-       * return of the most recent failed write -- -EPIPE is an overrun of the
-       * deadline, anything else is a different story. Every five seconds, not
-       * every draw: this writes to the instrument's own userfs. */
-      {
-        static unsigned long long diag_ms;
-        const unsigned long long now_ms = pcm_now_ms();
-        if (now_ms - diag_ms >= 5000) {
-          diag_ms = now_ms;
-          module_logf(
-              "audio: mix %llu us (module %llu us), max %llu us; "
-              "%lu mixed/%lu writes, %lu xruns, last write %d, %lu slow gets",
-              __atomic_load_n(&pcm_mix_ns_last, __ATOMIC_RELAXED) / 1000,
-              __atomic_load_n(&pcm_mod_ns_last, __ATOMIC_RELAXED) / 1000,
-              __atomic_load_n(&pcm_mix_ns_max, __ATOMIC_RELAXED) / 1000, mixed,
-              calls, __atomic_load_n(&audio_errors, __ATOMIC_RELAXED),
-              __atomic_load_n(&pcm_write_err, __ATOMIC_RELAXED),
-              __atomic_load_n(&pcm_get_slow, __ATOMIC_RELAXED));
-        }
-      }
-
-      /* An unknown format shows its numeric id, so a stream this code refuses
-       * can be named from the panel without a console. */
-      if (pcm_format_name(format)[0] == '?') {
+        menu_row(53, "STALL:", value);
+      } else if (pcm_format_name(format)[0] == '?') {
+        /* An unknown format shows its numeric id, so a stream this code
+         * refuses can be named from the panel without a console. */
         snprintf(value, sizeof value, "F%d %uC/%lu", format, channels,
                  __atomic_load_n(&audio_errors, __ATOMIC_RELAXED));
+        menu_row(53, "PCM/XRUNS:", value);
       } else {
         snprintf(value, sizeof value, "%s %uC/%lu", pcm_format_name(format),
                  channels,
                  __atomic_load_n(&audio_errors, __ATOMIC_RELAXED));
+        menu_row(53, "PCM/XRUNS:", value);
       }
-      menu_row(53, "PCM/XRUNS:", value);
     }
   } else if (menu_page == 1) {
     snprintf(value, sizeof value, "%lu / %lu B", midi_in_bytes, midi_out_bytes);
@@ -1271,6 +1653,16 @@ static int chord_partner(unsigned char a, unsigned char b) {
 static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
   static unsigned char out[4096];
   size_t in = 0, o = 0, inserts = 0;
+
+  /* First panel read: this thread gets its own fault stack. Units are loaded
+   * and torn down here, so this is the other thread that can be inside one. */
+  {
+    static int alt_installed;
+    if (!alt_installed) {
+      alt_installed = 1;
+      crash_altstack(crash_stack_panel, sizeof crash_stack_panel);
+    }
+  }
   panel_out_fd = fd;
   modules_load();
 
@@ -1402,6 +1794,9 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
    * page redraw keeps a unit or module page following playback. Both run on the
    * panel thread. */
   modules_tick();
+  /* Outside the menu on purpose: the audio path is observed while the user is
+   * playing, which is when the menu is closed. */
+  audio_diag_log();
   if (menu_open) page_redraw();
 
   if (o <= cap) {
@@ -2585,9 +2980,18 @@ static void pcm_add(unsigned char* base, unsigned long frame,
         s24_add(f, mono);
         continue;
       }
-      for (ch = 0; ch < pairs; ch++) {
-        s24_add(f + (size_t)ch * 8, float_to_s24(mix[i * 2]));
-        s24_add(f + (size_t)ch * 8 + 4, float_to_s24(mix[i * 2 + 1]));
+      /* Converted once per frame, not once per pair. The eight-channel stream
+       * is four pairs, so the obvious loop converted the same two samples
+       * eight times to write them four times -- on the instrument that is
+       * measurable next to the block's period. */
+      {
+        const int32_t l = float_to_s24(mix[i * 2]);
+        const int32_t r = float_to_s24(mix[i * 2 + 1]);
+
+        for (ch = 0; ch < pairs; ch++) {
+          s24_add(f + (size_t)ch * 8, l);
+          s24_add(f + (size_t)ch * 8 + 4, r);
+        }
       }
       if ((pi->channels & 1) != 0) s24_add(f + (size_t)pairs * 8, mono);
     }
@@ -2603,12 +3007,26 @@ static const void* pcm_mix(snd_pcm_t* pcm, const void* buf,
   unsigned long off;
   unsigned long long t_start, mod_ns = 0;
 
+  /* First call on the audio thread: give it a stack to fault on. Done here and
+   * not in a constructor because an alternate signal stack is per thread, and
+   * the daemon's audio thread does not exist when this object is loaded. */
+  {
+    static int alt_installed;
+    if (!alt_installed) {
+      alt_installed = 1;
+      crash_altstack(crash_stack_audio, sizeof crash_stack_audio);
+    }
+  }
+
   /* The whole hook is timed, not just the mixing loop: the copy in and the
    * scratch hand-over are part of what the audio thread pays, and a block
    * that misses the period because of them would otherwise look innocent. */
   t_start = pcm_now_ns();
+  __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+  __atomic_store_n(&pcm_stage, PCM_STAGE_HOOK, __ATOMIC_RELAXED);
   if (buf == NULL || frames == 0 || frames > PCM_SCRATCH_FRAMES) {
     pcm_skip_set(PCM_SKIP_BIG);
+    __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
     return buf;
   }
   pi = pcm_info_get(pcm);
@@ -2624,16 +3042,19 @@ static const void* pcm_mix(snd_pcm_t* pcm, const void* buf,
   }
   if (!modules_have_audio()) {
     pcm_skip_set(PCM_SKIP_NO_MODULE);
+    __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
     return buf;
   }
   if (pi == NULL || pi->channels == 0 || pi->bytes == 0) {
     pcm_skip_set(PCM_SKIP_UNRESOLVED);
+    __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
     return buf;
   }
 
   bytes = (size_t)frames * pi->channels * pi->bytes;
   if (bytes > sizeof pcm_scratch) {
     pcm_skip_set(PCM_SKIP_BIG);
+    __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
     return buf;
   }
   {
@@ -2647,6 +3068,7 @@ static const void* pcm_mix(snd_pcm_t* pcm, const void* buf,
           __atomic_load_n(&pcm_scratch_stamp, __ATOMIC_RELAXED);
       if (now - held <= 1000) {
         pcm_skip_set(PCM_SKIP_BUSY);
+        __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
         return buf;
       }
       __atomic_add_fetch(&pcm_scratch_steals, 1, __ATOMIC_RELAXED);
@@ -2665,10 +3087,22 @@ static const void* pcm_mix(snd_pcm_t* pcm, const void* buf,
     a = pcm_now_ns();
     modules_audio(mix, n);
     mod_ns += pcm_now_ns() - a;
-    pcm_add(pcm_scratch, off, pi, mix, n);
+    /* Adding silence is not free on the instrument's core: scanning 2n floats
+     * is a fraction of converting and summing n*channels samples. A module
+     * with nothing to say -- the common case while another engine plays --
+     * must not cost the whole conversion anyway. */
+    {
+      unsigned i;
+      int any = 0;
+      for (i = 0; i < n * 2; i++) {
+        if (mix[i] != 0.0f) { any = 1; break; }
+      }
+      if (any) pcm_add(pcm_scratch, off, pi, mix, n);
+    }
   }
   {
     const unsigned long long total = pcm_now_ns() - t_start;
+    __atomic_store_n(&pcm_frames_last, (unsigned)frames, __ATOMIC_RELAXED);
     __atomic_store_n(&pcm_mix_ns_last, total, __ATOMIC_RELAXED);
     pcm_note_max(&pcm_mix_ns_max, total);
     __atomic_store_n(&pcm_mod_ns_last, mod_ns, __ATOMIC_RELAXED);
@@ -2689,7 +3123,17 @@ long snd_pcm_writei(snd_pcm_t* pcm, const void* buf, unsigned long frames) {
     return -1;
   }
   {
-    const long got = real(pcm, pcm_mix(pcm, buf, frames), frames);
+    const void* mixed = pcm_mix(pcm, buf, frames);
+    long got;
+
+    /* The stage is set between the two calls on purpose: the mix has returned,
+     * so a block reported as WRITE is one the library is holding, not one of
+     * ours. That is the difference between a slow module and a dead stream. */
+    __atomic_store_n(&pcm_stage, PCM_STAGE_WRITE, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+    got = real(pcm, mixed, frames);
+    __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
     __atomic_add_fetch(&audio_calls, 1, __ATOMIC_RELAXED);
     if (got < 0) {
       __atomic_add_fetch(&audio_errors, 1, __ATOMIC_RELAXED);
@@ -2709,7 +3153,14 @@ long snd_pcm_mmap_writei(snd_pcm_t* pcm, const void* buf, unsigned long frames) 
     return -1;
   }
   {
-    const long got = real(pcm, pcm_mix(pcm, buf, frames), frames);
+    const void* mixed = pcm_mix(pcm, buf, frames);
+    long got;
+
+    __atomic_store_n(&pcm_stage, PCM_STAGE_WRITE, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+    got = real(pcm, mixed, frames);
+    __atomic_store_n(&pcm_stage, PCM_STAGE_IDLE, __ATOMIC_RELAXED);
+    __atomic_store_n(&pcm_beat_ms, pcm_now_ms(), __ATOMIC_RELAXED);
     __atomic_add_fetch(&audio_calls, 1, __ATOMIC_RELAXED);
     if (got < 0) {
       __atomic_add_fetch(&audio_errors, 1, __ATOMIC_RELAXED);

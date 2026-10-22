@@ -76,7 +76,7 @@ pages and the sequencer views reopen with their own content intact.
 
 | Tab | Shows |
 |---|---|
-| STATUS | daemon pid, uptime, blocks mixed per audio write, the recorded stream shape and xruns (a `MIXED/CALLS:` with a letter names why nothing was mixed) |
+| STATUS | daemon pid, uptime, blocks mixed per audio write, the recorded stream shape and xruns (a `MIXED/CALLS:` with a letter names why nothing was mixed), and a `STALL:` row when the audio thread has stopped |
 | MIDI | MIDI bytes in and out, messages and notes, the last note, and the name of the loaded transform module (or `NONE`) |
 
 The menu draws over the daemon's screen, and the daemon's last screen is
@@ -214,6 +214,21 @@ by its numeric id (`F5 8C/0`) rather than as `NONE`, so the instrument's own
 stream can be identified from the panel. `NONE 0C` means no write has reached
 the hook yet, which with `x` on the row below is the signature of a playback
 path this object is not on.
+
+When no block has been written for two seconds, that row becomes `STALL:` and
+names where the audio thread is:
+
+| Value | Stage |
+|---|---|
+| `S0` | no write entered: the daemon's playback thread is gone or waiting |
+| `S1` | inside this hook, copying or mixing a block |
+| `S2 M0` | inside module 0's `audio_render` — on the instrument, a unit's render |
+| `S3` | inside the library's own write, so the stream is not consuming |
+
+This exists because a wedged daemon takes the MIDI thread with it, so the log
+cannot be fetched: the panel is the only report left. The same line is written
+once per stall to `/tmp/logue-borg-audio.log`, with the counters and the last
+skip reason, for a run that is still alive when it is read.
 
 A module with nothing to add leaves the buffer alone. `samplerate` is written
 before the first audio block; `init` may still see 0, which should be treated as
@@ -355,8 +370,28 @@ registered. Unit pages sit after STATUS and MIDI; module pages follow them.
 | `userfs/Programs/borg-exec.log` | pre-switch state and any refusal |
 | `userfs/Programs/borg-shim.log` | attach confirmation from the loaded object |
 | `userfs/Programs/borg-modules.log` | module load and skip lines, and unit page registrations |
+| `userfs/Programs/borg-crash.log` | the daemon's last moment, if it faulted |
 | `/tmp/logue-borg-unit.log` | unit-side errors |
 | `/tmp/logue-borg-midi.log` | transformed MIDI notes |
+| `/tmp/logue-borg-audio.log` | audio path timing, the first xrun, and one line per audio stall naming the stage |
+
+The daemon installs no `SIGSEGV` or `SIGBUS` handler, and nothing restarts it,
+so one bad pointer anywhere — including inside a unit it hosts — takes the whole
+instrument down without a line anywhere. When borg is active it installs a
+handler that records the signal, the PC, LR, SP, the faulting address and which
+loaded object the addresses fall in, then re-raises with the default action.
+That report goes to userfs because a dead daemon forces a power cycle and
+`/tmp` would be wiped with it; it is one line, written once, as the process
+dies.
+
+`/tmp/logue-borg-audio.log` is the opposite case. It is written on the panel
+thread, never the audio thread, at most every ten seconds, and on the first
+occurrence of each fault: the mix time against the 667 µs a 32-frame write owns,
+the module's share of it, xruns and the negative return of the last failed
+write. It lives in tmpfs deliberately — a diagnostic that writes to flash every
+few seconds wears out the instrument it is diagnosing. Read it while the daemon
+is alive (`@exec cat /tmp/logue-borg-audio.log`); the crash report above is the
+part that survives.
 
 
 ## Notes

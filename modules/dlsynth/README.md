@@ -68,17 +68,25 @@ MASTER loads it.
 | `UNIT:` | the selected unit's display name from its header |
 | `CHANNEL:` | the MIDI channel it listens on, 1 to 16 |
 | `STATE:` | `READY`, `LOADING`, a failure reason, `NO SYNTH`, `NO DIR`, `BUSY`, or `NO UNIT`, followed by the last rendered block's peak as a percentage |
-| `NOTE/REND:` | note-ons accepted, then render calls made by the host since the unit was loaded |
+| `REND/US:` | render calls made by the host since the unit was loaded, then the **unit's own render** in microseconds at its worst |
 
-`NOTE/REND:` and the peak exist to answer one question from the panel: whether
-the host is asking this module for audio at all. A `REND` that stays at zero
-while `NOTES` rises means the daemon's playback was not mixed — the module
-never saw a block. A `REND` that rises with a non-zero peak means the unit is
-producing sound and the mix is the place to look.
+`REND/US:` and the peak exist to answer two questions from the panel. Whether
+the host is asking this module for audio at all: a `REND` that stays at zero
+while notes arrive means the daemon's playback was not mixed — the module never
+saw a block. And whether the unit can live inside the instrument's period: the
+drumlogue gives a 64-frame block 1333 µs, so a unit whose worst render is a
+large fraction of that is the reason the stream misses deadlines and crackles.
+The timing is taken around `unit_render` only, so it does not include borg's
+copy and conversion; those are in `/tmp/logue-borg-audio.log` as the host's
+share of the block. The number is held for the panel because that page is the
+only report that survives a daemon wedged in the audio path.
 
 - **Encoder 1** scrolls the synth list.
 - **Encoder 2** changes the channel. It wraps, and sends All Notes Off to the
-  unit before the new channel applies.
+  unit before the new channel applies. It deliberately logs nothing: a log line
+  here is an open/write/close on userfs flash **per detent**, and on this board
+  that write is long enough to miss the next 1.33 ms audio block — which is
+  heard as the channel change itself crackling.
 - **MASTER** loads the selected unit.
 
 The list holds only `.drmlgunit` files whose ELF header names the drumlogue
@@ -149,6 +157,36 @@ refuses the load with `BUSY` instead of tearing a unit down under a render.
 MIDI arrives on the MIDI thread, so it only writes small events to a lock-free
 ring; the audio thread applies them. Unit callbacks therefore run on one
 thread at a time, except init and teardown, which the gate covers.
+
+## When the unit is not playing
+
+An idle second synth costs real time on the instrument. The drumlogue's single
+Cortex-A7 has 1.33 ms per 32-frame block, and a unit's render plus the host's
+S24 conversion and mixing is a large share of that when another engine is
+already using the core. Borg's own numbers on the device, with the module
+loaded and rendering: about 190 µs per block, of which about 130 µs was the
+unit's render — roughly a fifth of the core — and xruns appeared only once the
+daemon's multi engine played as well.
+
+So render is gated the way the daemon gates its own units: on activity. After
+15000 consecutive blocks (about 10 s at the stream's 32-frame writes) with no
+event applied and nothing above -120 dBFS, `audio_render` returns without
+calling the unit; the host then does not copy or mix an empty block. Any event
+— note on, note off, controller — resets the count and the unit is rendered
+again from the next block, and any block above the floor resets it too. A
+release tail is therefore never cut: silence is what the unit has to produce
+anyway, and the module only stops asking for it.
+
+The floor is a threshold, not `== 0.0f`, and that matters on this instrument.
+`drumlogued` never sets the FPSCR flush-to-zero bit, so an idle oscillator's
+denormal tail is both inaudible and expensive; a unit that leaks one per block
+would otherwise be "producing sound" for ever and keep the gate open. Samples
+below the floor are written out as exact zeros, so neither the host's conversion
+nor the gate sees them.
+
+This assumes a unit takes its clock from events rather than from the number of
+times render is called. That is the daemon's own assumption about its units,
+and every oscillator unit tested here behaves that way.
 
 ## What is not there
 

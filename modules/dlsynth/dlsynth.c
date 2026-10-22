@@ -52,6 +52,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "borg_module.h"
@@ -141,6 +142,11 @@ static unsigned long g_dropped;
  * not a module was mixed into them. */
 static unsigned long g_renders;
 static int g_peak_pct;
+/* The unit's own render, in microseconds: the worst block since the unit was
+ * loaded. This is the number that decides whether the second synth can live
+ * inside the instrument's 1333 us period, and it is published on the panel
+ * because the log that would otherwise carry it dies with a wedged daemon. */
+static unsigned long g_render_us_max;
 
 /* The loaded unit. `ready` is published only after init and every declared
  * parameter default has been pushed, and cleared before teardown. */
@@ -156,6 +162,29 @@ static unsigned g_tail;
 static int g_audio_on;
 static int g_audio_busy;
 static unsigned g_copy_seq;
+
+/* A unit is rendered only while it has something to say. The daemon does the
+ * same -- a drumlogue part's render is gated on its voice being active -- and
+ * on the instrument's single Cortex-A7 the difference is not academic: a unit
+ * rendering silence still costs about a fifth of the core, and with the
+ * daemon's own multi engine playing, that is enough to miss the deadline. The
+ * stream's period is 64 frames (1.33 ms) written in 32-frame halves, so each
+ * write has 667 us of audio time to itself.
+ * The gate opens on any event (a note starts a voice) and closes only after
+ * this many blocks have produced silence. At the daemon's 32-frame write that
+ * is ten seconds; a unit that keeps producing sound, including one that runs on
+ * render alone, never reaches it because every non-silent block resets the
+ * count. */
+#define DLSYNTH_IDLE_BLOCKS 15000
+static unsigned long g_idle_blocks;
+
+/* What counts as silence for the gate. Not `== 0.0f`: an oscillator unit with
+ * no note keeps emitting denormal tails and rounding dust, and on this core a
+ * denormal is not free -- but at -120 dBFS it is inaudible either way. A value
+ * below the floor is written out as an exact zero, so the host's conversion
+ * and the gate both see silence. NaN is zeroed too: a unit that produces one
+ * must not poison the daemon's block. */
+#define DLSYNTH_SILENCE 1e-6f
 
 /* The zeroed input buffer handed to the unit. A synth declares no input
  * channels, but passing a valid pointer costs 512 bytes and removes a way for
@@ -177,6 +206,17 @@ static void dlog(const char* fmt, ...) {
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
   g_host->log(line);
+}
+
+/* Monotonic microseconds, for timing one unit render. clock_gettime costs tens
+ * of nanoseconds through the vDSO on this board, which is noise beside the
+ * render it is measuring. */
+static unsigned long long now_us(void) {
+  struct timespec ts;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+  return (unsigned long long)ts.tv_sec * 1000000ULL +
+         (unsigned long long)ts.tv_nsec / 1000;
 }
 
 static int ends_with(const char* s, const char* suffix) {
@@ -341,6 +381,16 @@ static int entry_sort(const void* a, const void* b) {
   return c != 0 ? c : strcmp(x->file, y->file);
 }
 
+/* The list is rebuilt when the directory changes, not on every page open. Each
+ * candidate costs a header read from userfs flash, and flash I/O on this board
+ * can keep the core long enough to miss an audio block: the page is opened
+ * while the instrument is playing, so scanning a dozen units each time it is
+ * shown is heard as artifacts. Adding or removing a file changes the
+ * directory's mtime, which is what re-arms the scan. */
+static time_t g_scan_sec;
+static long g_scan_nsec;
+static int g_scanned;
+
 /* Rebuild the list. Synth units only, by the header's target field; an effect,
  * a delay or a master effect is not listed at all and can therefore not be
  * selected. The selected row is kept by file name when it still exists. */
@@ -348,6 +398,16 @@ static void scan_units(void) {
   DIR* d;
   struct dirent* e;
   char keep[DLSYNTH_FILE_MAX] = "";
+  struct stat st;
+
+  if (g_scanned && stat(g_dir, &st) == 0 && st.st_mtime == g_scan_sec &&
+      st.st_mtim.tv_nsec == g_scan_nsec) {
+    return;
+  }
+  if (stat(g_dir, &st) == 0) {
+    g_scan_sec = st.st_mtime;
+    g_scan_nsec = st.st_mtim.tv_nsec;
+  }
 
   if (g_selected >= 0 && g_selected < g_count) {
     snprintf(keep, sizeof keep, "%s", g_list[g_selected].file);
@@ -360,6 +420,7 @@ static void scan_units(void) {
     g_selected = -1;
     return;
   }
+  g_scanned = 1;
   while ((e = readdir(d)) != NULL && g_count < DLSYNTH_LIST_MAX) {
     char path[DLSYNTH_DIR_MAX + DLSYNTH_FILE_MAX];
     char hname[UNIT_NAME_LEN + 1];
@@ -428,12 +489,16 @@ static void push_event(uint8_t type, uint8_t a, uint8_t b) {
 /* Called only on the audio thread, with the unit ready and the load gate open.
  * The unit callbacks below are the only place the queued events become unit
  * calls, which is what keeps the MIDI thread out of the unit. */
-static void drain_events(void) {
+/* Returns 1 when anything was applied, so the caller can wake a render gate
+ * even for an event this build does not map. */
+static int drain_events(void) {
   unsigned tail = g_tail;
+  int applied = 0;
 
   while (tail != __atomic_load_n(&g_head, __ATOMIC_ACQUIRE)) {
     const dlsynth_event e = g_ring[tail];
     tail = (tail + 1) & (DLSYNTH_RING - 1);
+    applied = 1;
 
     switch (e.type) {
       case EV_NOTE_ON:
@@ -463,6 +528,7 @@ static void drain_events(void) {
     }
   }
   __atomic_store_n(&g_tail, tail, __ATOMIC_RELEASE);
+  return applied;
 }
 
 /* --------------------------------------------------------------- the unit */
@@ -487,7 +553,11 @@ static const sample_wrapper_t* sample_get(uint8_t bank, uint8_t index) {
  * same dlopen handle; see the file comment. */
 static void* open_unit_copy(const char* src, char* err, size_t errn) {
   char dst[DLSYNTH_DIR_MAX + 64];
-  unsigned char buf[65536];
+  /* 8 KB, not 64: this runs on the daemon's panel thread, whose stack is the
+   * daemon's to size, and a sixty-four kilobyte frame under dlopen and snprintf
+   * is a stack overflow waiting for a thread that was given less. The copy
+   * loop does not care how big each read is. */
+  unsigned char buf[8192];
   int in, out = -1;
   void* handle;
   unsigned tries;
@@ -650,6 +720,21 @@ static int open_unit(int index, char* err, size_t errn) {
   }
   if (u.resume != NULL) u.resume();
 
+  /* Warm the unit here, on the panel thread, before the audio gate opens.
+   * The first render is not like the others: its code pages are not resident
+   * yet and its PLT entries still resolve on first call. On the audio thread
+   * each of those page faults and bindings is a missed 1.33 ms deadline, which
+   * is heard as artifacts exactly at the moment the unit is loaded. The output
+   * is discarded and 64 frames of silence advances nothing audible.
+   *
+   * A unit whose first render faults does it here, where the crash report
+   * names the unit and the audio thread is not holding a period open. */
+  {
+    float warm[DLSYNTH_CHUNK * 2];
+    memset(warm, 0, sizeof warm);
+    u.render(g_input, warm, DLSYNTH_CHUNK);
+  }
+
   u.ready = 1;
   g_unit = u;
   return 0;
@@ -666,9 +751,9 @@ fail:
 static int audio_stop(void) {
   int i;
 
-  __atomic_store_n(&g_audio_on, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_audio_on, 0, __ATOMIC_SEQ_CST);
   for (i = 0; i < 200; i++) {
-    if (!__atomic_load_n(&g_audio_busy, __ATOMIC_ACQUIRE)) return 0;
+    if (!__atomic_load_n(&g_audio_busy, __ATOMIC_SEQ_CST)) return 0;
     usleep(1000);
   }
   return -1;
@@ -682,7 +767,7 @@ static void load_index(int index) {
     return;
   }
   if (audio_stop() != 0) {
-    __atomic_store_n(&g_audio_on, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_audio_on, 1, __ATOMIC_SEQ_CST);
     set_state("BUSY");
     dlog("dlsynth: audio busy, not switching");
     return;
@@ -693,7 +778,9 @@ static void load_index(int index) {
                    __ATOMIC_RELEASE);
   __atomic_store_n(&g_notes, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&g_renders, 0, __ATOMIC_RELAXED);
+  g_idle_blocks = 0;
   __atomic_store_n(&g_peak_pct, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_render_us_max, 0, __ATOMIC_RELAXED);
   g_dropped = 0;
   set_state("LOADING");
   err[0] = '\0';
@@ -708,7 +795,7 @@ static void load_index(int index) {
          (unsigned)(g_host->samplerate != 0 ? g_host->samplerate
                                             : DLSYNTH_DEFAULT_RATE));
   }
-  __atomic_store_n(&g_audio_on, 1, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_audio_on, 1, __ATOMIC_SEQ_CST);
 }
 
 /* ------------------------------------------------------------- the callbacks */
@@ -717,15 +804,26 @@ static void dlsynth_audio(float* out, uint32_t frames) {
   uint32_t off;
 
   if (out == NULL || frames == 0) return;
-  if (!__atomic_load_n(&g_audio_on, __ATOMIC_ACQUIRE)) return;
-  __atomic_store_n(&g_audio_busy, 1, __ATOMIC_RELEASE);
-  if (!__atomic_load_n(&g_audio_on, __ATOMIC_ACQUIRE) ||
-      !__atomic_load_n(&g_unit.ready, __ATOMIC_ACQUIRE)) {
-    __atomic_store_n(&g_audio_busy, 0, __ATOMIC_RELEASE);
+  /* Sequentially consistent on both flags, not acquire/release. This is a
+   * Dekker handshake with the panel thread: the audio thread reads the gate
+   * then sets busy, the panel clears the gate then reads busy. With weaker
+   * ordering both reads can see the old value -- the panel concludes the audio
+   * thread is out and dlclose()s the unit while a render is about to start.
+   * A unit unmapped under a running render is a SIGSEGV in drumlogued, and
+   * nothing on this instrument survives that. */
+  if (!__atomic_load_n(&g_audio_on, __ATOMIC_SEQ_CST)) return;
+  __atomic_store_n(&g_audio_busy, 1, __ATOMIC_SEQ_CST);
+  if (!__atomic_load_n(&g_audio_on, __ATOMIC_SEQ_CST) ||
+      !__atomic_load_n(&g_unit.ready, __ATOMIC_SEQ_CST)) {
+    __atomic_store_n(&g_audio_busy, 0, __ATOMIC_SEQ_CST);
     return;
   }
 
-  drain_events();
+  if (drain_events()) g_idle_blocks = 0;
+  if (g_idle_blocks > DLSYNTH_IDLE_BLOCKS) {
+    __atomic_store_n(&g_audio_busy, 0, __ATOMIC_SEQ_CST);
+    return;
+  }
   for (off = 0; off < frames; off += DLSYNTH_CHUNK) {
     float temp[DLSYNTH_CHUNK * 2];
     const uint32_t n = (frames - off > DLSYNTH_CHUNK)
@@ -736,20 +834,45 @@ static void dlsynth_audio(float* out, uint32_t frames) {
     memset(temp, 0, (size_t)n * 2 * sizeof(float));
     /* Real units cap their own render at 64 frames. The descriptor says 64,
      * so the host's block is split here rather than handed over whole. */
-    g_unit.render(g_input, temp, n);
+    {
+      const unsigned long long started = now_us();
+      g_unit.render(g_input, temp, n);
+      {
+        const unsigned long long took = now_us() - started;
+        unsigned long worst =
+            __atomic_load_n(&g_render_us_max, __ATOMIC_RELAXED);
+        /* A maximum from the audio thread, read on the panel: the read-then-
+         * store race can only lose a value, and losing one sample of a
+         * diagnostic is better than a lock on this path. */
+        if (took > worst) {
+          __atomic_store_n(&g_render_us_max, (unsigned long)took,
+                           __ATOMIC_RELAXED);
+        }
+      }
+    }
     {
       float peak = 0.0f;
       for (i = 0; i < n * 2; i++) {
-        const float v = temp[i] < 0.0f ? -temp[i] : temp[i];
-        if (v > peak) peak = v;
+        const float s = temp[i];
+        if (!(s == s) || (s > -DLSYNTH_SILENCE && s < DLSYNTH_SILENCE)) {
+          temp[i] = 0.0f;
+        } else {
+          const float v = s < 0.0f ? -s : s;
+          if (v > peak) peak = v;
+        }
         out[off * 2 + i] += temp[i];
+      }
+      if (peak > 0.0f) {
+        g_idle_blocks = 0;
+      } else {
+        g_idle_blocks++;
       }
       if (peak > 9.99f) peak = 9.99f;
       __atomic_store_n(&g_peak_pct, (int)(peak * 100.0f), __ATOMIC_RELAXED);
     }
     __atomic_add_fetch(&g_renders, 1, __ATOMIC_RELAXED);
   }
-  __atomic_store_n(&g_audio_busy, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_audio_busy, 0, __ATOMIC_SEQ_CST);
 }
 
 static void dlsynth_midi_msg(void* port, const unsigned char* data, size_t n) {
@@ -760,8 +883,8 @@ static void dlsynth_midi_msg(void* port, const unsigned char* data, size_t n) {
   if ((data[0] & 0x80) == 0 || (data[0] & 0xf0) == 0xf0) return;
   channel = (unsigned)(data[0] & 0x0f) + 1;
   if (channel != __atomic_load_n(&g_channel, __ATOMIC_ACQUIRE)) return;
-  if (!__atomic_load_n(&g_audio_on, __ATOMIC_ACQUIRE) ||
-      !__atomic_load_n(&g_unit.ready, __ATOMIC_ACQUIRE)) {
+  if (!__atomic_load_n(&g_audio_on, __ATOMIC_SEQ_CST) ||
+      !__atomic_load_n(&g_unit.ready, __ATOMIC_SEQ_CST)) {
     return;
   }
 
@@ -878,9 +1001,9 @@ static void dlsynth_page(void) {
            __atomic_load_n(&g_peak_pct, __ATOMIC_RELAXED));
   g_host->row(44, "STATE:", value);
   snprintf(value, sizeof value, "%lu/%lu",
-           __atomic_load_n(&g_notes, __ATOMIC_RELAXED),
-           __atomic_load_n(&g_renders, __ATOMIC_RELAXED));
-  g_host->row(53, "NOTE/REND:", value);
+           __atomic_load_n(&g_renders, __ATOMIC_RELAXED),
+           __atomic_load_n(&g_render_us_max, __ATOMIC_RELAXED));
+  g_host->row(53, "REND/US:", value);
 }
 
 static void dlsynth_page_enter(void) {
@@ -909,7 +1032,12 @@ static void dlsynth_encoder(int index, int delta) {
     if (__atomic_load_n(&g_unit.ready, __ATOMIC_ACQUIRE)) {
       push_event(EV_ALL_OFF, 0, 0);
     }
-    dlog("dlsynth: channel %d", ch);
+    /* Deliberately no log line. `log` is a file open/write/close on userfs
+     * flash, and an encoder sends one step per detent: the write holds the
+     * core for milliseconds on this board, the next 1.33 ms audio block misses
+     * its deadline, and the click that produces was reported as the channel
+     * change itself being broken. The page already shows CHANNEL: and there is
+     * nothing here a log would add. */
   }
 }
 
