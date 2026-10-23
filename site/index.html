@@ -3,16 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Borg</title>
+    <title>borg - extension framework</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="top-banner">
-        <div class="banner-title">Borg</div>
+        <div class="banner-title"></div>
         <a class="banner-link" href="https://github.com/rgrvmusic/borg">GitHub</a>
     </div>
     <main>
-        <h1>Borg</h1>
+        <h1>borg - extension framework</h1>
         <p>A synth unit that switches <code>drumlogued</code> to run extensions in place. Select the unit and fire <code>GateOn()</code>: the daemon re-executes itself under an embedded preload object, same pid, with no rootfs writes. A power cycle restores everything.</p>
 
         <h2>Extensions</h2>
@@ -34,6 +34,9 @@
             <li>Save the program, so the daemon reloads it after the switch.</li>
             <li>Fire <code>GateOn()</code>.</li>
         </ol>
+
+        <h2>Downloads</h2>
+        <p>Downloads are available at <a href="//itchio.rgrv.nl/borg-drumlogue">our store</a>. They are offered for free, though a small donation would be appreciated.</p>
 
         <h2>Documentation</h2>
         <p>See the <a href="https://github.com/gbraad-logue/borg/blob/main/borg_drumlogue/README.md">unit README</a> for details.</p>
