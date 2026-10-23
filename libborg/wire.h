@@ -1,29 +1,30 @@
-/* The exec module's dialogue with the far end, and nothing else.
+/* The SysEx framing a module uses to talk to a far end, and nothing else.
  *
  * This is rgexec's wire, moved unchanged into a module. The instrument's MIDI
  * manager already holds every port it reads, and a unit is given no MIDI-out
  * API, so the module is handed complete SysEx messages by the resident object
  * and answers on the output paired with the input they arrived on.
  *
- *   in    F0 7D 3E @exec <command> F7
+ *   in    F0 7D 3E <command> F7
  *   out   F0 7D 4F <output chunk> F7                  'O'  output
  *   out   F0 7D 45 <three digits> F7                  'E'  status
  *   out   F0 7D 21 <text> F7                          '!'  refused
  *
- * 0x7D is the MIDI specification's non-commercial id. The 0x3E in a request,
- * and the rule that a body opening with a reply tag is dropped in silence,
- * keep an echo of our own output from being read back as a command.
+ * A module owns its own command words after the tag, such as `@exec` or
+ * `@storage`. 0x7D is the MIDI specification's non-commercial id. The 0x3E in
+ * a request, and the rule that a body opening with a reply tag is dropped in
+ * silence, keep an echo of our own output from being read back as a command.
  *
  * The header is free of system calls so that the framing can be tested without
  * the daemon. */
 
-#ifndef BORG_EXEC_WIRE_H
-#define BORG_EXEC_WIRE_H
+#ifndef BORG_WIRE_H
+#define BORG_WIRE_H
 
 #include <cstddef>
 #include <cstdint>
 
-namespace execwire {
+namespace borgwire {
 
 constexpr uint8_t kSysExStart = 0xF0;
 constexpr uint8_t kSysExEnd = 0xF7;
@@ -112,8 +113,8 @@ enum Refusal {
  * does not own. Realtime bytes are ignored, anything that is not our header is
  * dropped in silence, and an F0 arriving mid-message starts a new one. Silence
  * matters more here than it did in the unit: this reader is offered every
- * message on every port the daemon holds, so another device's SysEx -- including
- * another maker's use of 0x7D -- must draw no reply at all. A message refused
+ * message on every port the daemon holds, so another device's SysEx (including
+ * another maker's use of 0x7D) must draw no reply at all. A message refused
  * for its contents is consumed to its terminator before the refusal is
  * reported, so the fragment before the bad byte is never run. */
 class Reader {
@@ -127,6 +128,7 @@ class Reader {
       case kHead:
         if (b == kManufId) {
           len_ = 0;
+          cmd_[0] = '\0';
           dirty_ = kRefusalNone;
           state_ = kTag;
         } else if (b == kSysExStart) {
@@ -151,17 +153,21 @@ class Reader {
         if (b == kSysExEnd) {
           state_ = kIdle;
           ended_ = true;
+          /* Terminated even when refused, so a caller that owns only some of
+           * the words on the wire can tell whether a refused message was one
+           * of its own. */
+          cmd_[len_] = '\0';
           if (dirty_ != kRefusalNone) return false;
           if (len_ == 0) {
             dirty_ = kRefusalEmpty;
             return false;
           }
-          cmd_[len_] = '\0';
           return true;
         }
         if (b == kSysExStart) {
           state_ = kHead;
           len_ = 0;
+          cmd_[0] = '\0';
           break;
         }
         if (!Printable(b)) {
@@ -215,6 +221,6 @@ inline const char* RefusalText(Refusal r) {
   }
 }
 
-}  // namespace execwire
+}  // namespace borgwire
 
-#endif  // BORG_EXEC_WIRE_H
+#endif  // BORG_WIRE_H

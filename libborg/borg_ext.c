@@ -20,12 +20,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,6 +36,8 @@
 #include "borg_module.h"
 #define BORG_UNIT_BUILD 1
 #include "borg_unit.h"
+
+extern char** environ;
 
 #ifndef LOGUE_BORG_MIDI_LOG
 #define LOGUE_BORG_MIDI_LOG "/tmp/logue-borg-midi.log"
@@ -713,6 +718,46 @@ static void module_page_draw(const borg_module* m) {
   pthread_mutex_unlock(&module_call_lock);
 }
 
+/* An ABI 3 page that asks for input. The menu sends it the buttons it does not
+ * keep for itself, and the encoders while the page is active, so a page can
+ * scroll a list without the knob also editing the daemon's page underneath. */
+static int module_takes_input(const borg_module* m) {
+  return m != NULL && m->abi >= 3 &&
+         (m->capabilities & BORG_CAP_INPUT) != 0;
+}
+
+static void module_page_enter(int page) {
+  const borg_module* m = page_module(page);
+  if (!module_takes_input(m) || m->page_enter == NULL) return;
+  pthread_mutex_lock(&module_call_lock);
+  m->page_enter();
+  pthread_mutex_unlock(&module_call_lock);
+}
+
+static void module_page_leave(int page) {
+  const borg_module* m = page_module(page);
+  if (!module_takes_input(m) || m->page_leave == NULL) return;
+  pthread_mutex_lock(&module_call_lock);
+  m->page_leave();
+  pthread_mutex_unlock(&module_call_lock);
+}
+
+static void modules_key(int page, int index, int down) {
+  const borg_module* m = page_module(page);
+  if (!module_takes_input(m) || m->key == NULL) return;
+  pthread_mutex_lock(&module_call_lock);
+  m->key(index, down);
+  pthread_mutex_unlock(&module_call_lock);
+}
+
+static void modules_encoder(int page, int index, int delta) {
+  const borg_module* m = page_module(page);
+  if (!module_takes_input(m) || m->encoder == NULL) return;
+  pthread_mutex_lock(&module_call_lock);
+  m->encoder(index, delta);
+  pthread_mutex_unlock(&module_call_lock);
+}
+
 static void menu_draw(void) {
   unsigned char fill[12];
   char value[24];
@@ -721,7 +766,10 @@ static void menu_draw(void) {
 
   if (panel_out_fd < 0) return;
   /* A unit can suspend while its page is open, which takes the page with it. */
-  if (pages > 0 && menu_page >= pages) menu_page = pages - 1;
+  if (pages > 0 && menu_page >= pages) {
+    module_page_leave(menu_page);
+    menu_page = pages - 1;
+  }
 
   /* The daemon's page preamble: the whole screen, then the title band, both
    * role 0. */
@@ -870,11 +918,15 @@ static void menu_show(int fd) {
   /* A module copied since the load point is picked up here. */
   modules_rescan();
   menu_draw();
+  /* The first page became the active one without a PAGE key, so its enter
+   * edge is owed here rather than only in the paging code. */
+  module_page_enter(menu_page);
 }
 
 static void menu_hide(int fd) {
   static const unsigned char seq_mode[4] = {0x85, 0x04, 0x04, 0x01};
   unsigned char fill[12];
+  module_page_leave(menu_page);
   menu_open = 0;
   if (view_mode == 1) {
     /* Switch back to the view the panel has been keeping. Nothing is erased or
@@ -1044,14 +1096,23 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
         }
       }
 
-      if (down && !chord && menu_open) {
+      if (!chord && menu_open) {
         const int pages = page_count();
-        if (key == KEY_PAGE_DOWN) {
+        if (down && key == KEY_PAGE_DOWN) {
+          module_page_leave(menu_page);
           menu_page = (menu_page + 1) % pages;
+          module_page_enter(menu_page);
           menu_draw();
-        } else if (key == KEY_PAGE_UP) {
+        } else if (down && key == KEY_PAGE_UP) {
+          module_page_leave(menu_page);
           menu_page = (menu_page + pages - 1) % pages;
+          module_page_enter(menu_page);
           menu_draw();
+        } else if (key != KEY_PAGE_UP && key != KEY_PAGE_DOWN) {
+          /* The menu keeps its own keys. Everything else belongs to the page
+           * when the page asks for input, including the release, so a module
+           * can hold a key if it needs to. */
+          modules_key(menu_page, key, down ? 1 : 0);
         }
       }
 
@@ -1071,6 +1132,19 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
       out[o++] = frame[0];
       out[o++] = frame[1];
       out[o++] = frame[2];
+      in += 3;
+    } else if (buf[in] == 0x81) {
+      /* An endless encoder, three bytes. On a page that asks for input the
+       * menu takes it; elsewhere it is the daemon's, as before. */
+      const int idx = buf[in + 1];
+      const int raw = buf[in + 2];
+      const int delta = (raw & 0x40) ? raw - 128 : raw;
+      if (menu_open && module_takes_input(page_module(menu_page))) {
+        modules_encoder(menu_page, idx, delta);
+      } else {
+        memcpy(out + o, buf + in, 3);
+        o += 3;
+      }
       in += 3;
     } else if (buf[in] == 0xfe) {
       size_t len = (in + 4 <= got) ? 4 : got - in;
@@ -1095,6 +1169,89 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
     return o;
   }
   return got;
+}
+
+/* ------------------------------------------------------------- re-exec
+ *
+ * The unit's switch, made available to a module. A session switch has to
+ * happen in place: the daemon opens its userfs once, and only a new main will
+ * read another. The caller has already mounted the chosen tree where the
+ * daemon expects it. This returns only when execve itself failed, because on
+ * success it does not return. */
+
+__attribute__((visibility("default"))) int borg_reexec(void) {
+  static char cmdline[4096];
+  static char* argv[64];
+  static char* envp[192];
+  static char preload[1024];
+  const char* saved;
+  char** e;
+  size_t off;
+  int fd, n, argc = 0, envc = 0;
+
+  saved = getenv("LOGUE_BORG_PRELOAD");
+  if (saved == NULL || saved[0] == '\0') return -ENOENT;
+
+  fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline",
+                    O_RDONLY | O_CLOEXEC, 0);
+  if (fd < 0) return -errno;
+  n = (int)syscall(SYS_read, fd, cmdline, sizeof cmdline - 1);
+  syscall(SYS_close, fd);
+  if (n <= 0) return -EIO;
+  cmdline[n] = '\0';
+
+  off = 0;
+  while (off < (size_t)n && argc < (int)(sizeof argv / sizeof argv[0]) - 1) {
+    argv[argc++] = cmdline + off;
+    off += strlen(cmdline + off) + 1;
+  }
+  argv[argc] = NULL;
+
+  snprintf(preload, sizeof preload, "LD_PRELOAD=%s", saved);
+  for (e = environ;
+       *e != NULL && envc < (int)(sizeof envp / sizeof envp[0]) - 2; ++e) {
+    if (strncmp(*e, "LD_PRELOAD=", 11) == 0) continue;
+    if (strncmp(*e, "LOGUE_BORG_ACTIVE=", 18) == 0) continue;
+    if (strncmp(*e, "LOGUE_BORG_PID=", 15) == 0) continue;
+    if (strncmp(*e, "LOGUE_BORG_PRELOAD=", 19) == 0) continue;
+    if (strncmp(*e, "LOGUE_BORG_SHIM=", 16) == 0) continue;
+    envp[envc++] = *e;
+  }
+  envp[envc++] = preload;
+  envp[envc] = NULL;
+
+  /* execve keeps the calling thread's scheduling state. A switch can be asked
+   * for from the panel thread or a MIDI thread; neither should carry a
+   * realtime class or a lone CPU into the new daemon. */
+  {
+    struct sched_param param;
+    cpu_set_t all;
+    sigset_t none;
+    const long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    int i;
+
+    memset(&param, 0, sizeof param);
+    if (sched_getscheduler(0) != SCHED_OTHER) {
+      sched_setscheduler(0, SCHED_OTHER, &param);
+    }
+    setpriority(PRIO_PROCESS, 0, 0);
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, NULL);
+    CPU_ZERO(&all);
+    if (cpus > 0 && cpus <= CPU_SETSIZE) {
+      for (i = 0; i < (int)cpus; ++i) CPU_SET(i, &all);
+      sched_setaffinity(0, sizeof all, &all);
+    }
+  }
+
+  fflush(NULL);
+  for (fd = 3; fd < 1024; ++fd) {
+    const int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+  }
+
+  execve("/proc/self/exe", argv, envp);
+  return -errno;
 }
 
 /* ---------------------------------------------------------------- open path */

@@ -54,6 +54,10 @@ else is run by the kernel.
 answer without starting anything. `storage probe` asks whether `mount(2)` is
 permitted with a tmpfs, a bind mount and a full cleanup, all inside `/tmp`.
 
+The storage module has its own namespace on the same wire. `tools/borgexec.py`
+sends a request that begins with `@` unchanged, so `run '@storage sessions'`
+reaches it; the two modules ignore each other's traffic.
+
 Any other word is a command. The module writes a script in `/tmp`, points
 `/proc/sys/kernel/hotplug` at it, and pokes a uevent. The kernel's helper thread
 starts the script, which puts `/sbin/mdev` back before it runs the command. The

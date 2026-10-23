@@ -52,9 +52,9 @@ extern char** environ;
 
 namespace {
 
-using execwire::kMaxChunk;
-using execwire::kMaxEncoded;
-using execwire::Reader;
+using borgwire::kMaxChunk;
+using borgwire::kMaxEncoded;
+using borgwire::Reader;
 
 /* The paths the commands read. They are the instrument's own; the overrides
  * exist so a test can lay out a scratch tree instead. The device build passes
@@ -165,7 +165,7 @@ void Emit(void* port, const char* buf, size_t len) {
   for (size_t i = 0; i < len; i += kMaxChunk) {
     int take = static_cast<int>(len - i);
     if (take > kMaxChunk) take = kMaxChunk;
-    Raw(port, enc, execwire::EncodeOutput(
+    Raw(port, enc, borgwire::EncodeOutput(
                        reinterpret_cast<const uint8_t*>(buf + i), take, enc));
   }
 }
@@ -188,12 +188,12 @@ void Notice(void* port, const char* text) {
   char line[kMaxChunk + 1];
   char enc[kMaxEncoded];
   snprintf(line, sizeof line, "%s", text);
-  Raw(port, enc, execwire::EncodeNotice(line, enc));
+  Raw(port, enc, borgwire::EncodeNotice(line, enc));
 }
 
 void AtEnd(void* port, int code) {
   char enc[16];
-  Raw(port, enc, execwire::EncodeExit(code, enc));
+  Raw(port, enc, borgwire::EncodeExit(code, enc));
 }
 
 /* ------------------------------------------------------------------- small */
@@ -1344,8 +1344,8 @@ void AtHot(void* port, const char* command) {
   g.hot_port = port;
   g.hot_active = 1;
 
-  snprintf(line, sizeof line, "!exec: armed through %.100s; the answer "
-                              "follows, and is in %.150s", last, out_path);
+  snprintf(line, sizeof line, "!armed: running through %.100s; the answer "
+                              "follows on this cable", last);
   Notice(port, line);
 }
 
@@ -1365,7 +1365,7 @@ void TickHot(void) {
       if (now >= g.hot_deadline_ms) {
         char line[320];
         snprintf(line, sizeof line,
-                 "!exec: no answer after %d seconds; the command is still "
+                 "!timeout: no answer after %d seconds; the command is still "
                  "running, and %.150s holds what it has written",
                  kCommandSeconds, g.hot_out);
         Notice(g.hot_port, line);
@@ -1403,7 +1403,7 @@ void TickHot(void) {
   if (NowMs() >= g.hot_deadline_ms) {
     char line[320];
     snprintf(line, sizeof line,
-             "!exec: no answer after %d seconds; the command is still running, "
+             "!timeout: no answer after %d seconds; the command is still running, "
              "and %.150s holds what it has written", kCommandSeconds, g.hot_out);
     Notice(g.hot_port, line);
     Logf("deadline with an arming outstanding: %s", g.hot_out);
@@ -1483,13 +1483,11 @@ void Handle(void* port, const char* cmd) {
   }
 
   if (strncmp(cmd, "@exec", 5) != 0 || (cmd[5] != '\0' && cmd[5] != ' ')) {
-    char line[160];
-    if (cmd[0] == '@') {
-      snprintf(line, sizeof line, "!moved: use @exec, as in @exec storage");
-    } else {
-      snprintf(line, sizeof line, "!ns: commands start with @exec");
-    }
-    Notice(port, line);
+    /* An @ that is not @exec names another module's namespace. Every module is
+     * offered every message, so answering one that is not ours would race the
+     * module that owns it and put this refusal in front of its reply. */
+    if (cmd[0] == '@') return;
+    Notice(port, "!ns: commands start with @exec");
     Logf("not an @exec command: %s", cmd);
     AtEnd(port, 2);
     return;
@@ -1506,7 +1504,7 @@ void exec_midi_in(void* port, const unsigned char* data, size_t n) {
       Handle(port, g.reader.Command());
       continue;
     }
-    const char* text = execwire::RefusalText(g.reader.TakeRefusal());
+    const char* text = borgwire::RefusalText(g.reader.TakeRefusal());
     if (text != nullptr) Notice(port, text);
   }
 }
@@ -1547,7 +1545,11 @@ const borg_module exec_module = {
   exec_init,
   exec_page,
   exec_midi_in,
-  exec_tick
+  exec_tick,
+  nullptr,
+  nullptr,
+  nullptr,
+  nullptr
 };
 
 }  // namespace

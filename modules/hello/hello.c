@@ -29,6 +29,10 @@ static const borg_module hello_module = {
   hello_init,
   hello_page,
   NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
   NULL
 };
 

@@ -10,7 +10,9 @@
 
 Every request goes out as `@exec <command>`, which is the module's namespace on
 a port the borg extension shares with whatever else is playing. You do not have
-to type the prefix; `run info` and `run '@exec info'` send the same bytes.
+to type the prefix; `run info` and `run '@exec info'` send the same bytes. A
+command that names another module namespace itself is sent unchanged, so
+`run '@storage sessions'` reaches the storage module.
 
 WHAT IS ANSWERED WITHOUT A PROCESS. Nothing in drumlogued may create a process,
 so `info`, `probe`, `cat`, `ls` and `storage` are answered inside the daemon:
@@ -74,9 +76,11 @@ NOTICES = {
     b"!moved": "the old bare form; every request now starts with @exec",
     b"!ns": "a request did not start with @exec",
     b"!exec": "the kernel's helper could not be armed, or had nothing to run",
+    b"!armed": "the kernel's helper took the command; its answer follows",
+    b"!timeout": "the helper ran but did not answer in time",
     b"!cat": "the file could not be read",
     b"!ls": "the directory could not be read",
-    b"!storage": "no such storage word",
+    b"!storage": "the storage module refused the request",
 }
 
 # The drumlogue's own USB gadget. On the computer it is an ordinary Korg card,
@@ -380,8 +384,9 @@ def watch(port, seconds):
 
 
 def wire_command(command):
-    """`info` and `@exec info` send the same bytes; only this decides."""
-    if command == PREFIX or command.startswith(PREFIX + " "):
+    """`info` and `@exec info` send the same bytes; a named namespace is sent
+    as it was typed, so another module's commands are reachable."""
+    if command.startswith("@"):
         return command
     return PREFIX + " " + command
 
