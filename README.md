@@ -1,13 +1,14 @@
-Borg
-====
+borg - extension framework
+==========================
 
+
+![](./media/borg-green.png)
 
 A synth unit that switches `drumlogued` to run extensions in place. Select
 the unit and fire `GateOn()`: the daemon re-executes itself under an embedded
 preload object, same pid, with no rootfs writes.
 
 ![](./docs/borg-screen.png)
-
 
 The loaded object adds a status menu, opened with MUTE and MASTER, a writable
 MIDI transform for modules (the transpose and velocity controls are
