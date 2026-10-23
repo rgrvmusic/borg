@@ -3,4 +3,4 @@
 *.borgmodule
 /*/.dep
 /*/build
-
+*.pyc
