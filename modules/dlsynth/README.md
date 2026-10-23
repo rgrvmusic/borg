@@ -1,5 +1,11 @@
 # dlsynth — a second synth inside borg
 
+
+> [!NOTE]
+> Very unreliable. This causes the single core to be overcommitted.
+> The panel becomes unresponsive when used. Better not to use this now.
+
+
 `dlsynth.borgmodule` adds a drumlogue synth **unit** to the daemon borg already
 runs, on a MIDI channel chosen on its own panel page. The unit is an ordinary
 `.drmlgunit`: the module uses the same 26-byte runtime descriptor and the same
