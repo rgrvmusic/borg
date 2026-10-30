@@ -300,17 +300,20 @@ bool UserfsIsForeign() {
 
 struct Device {
   char name[24];
-  int partition;
 };
 
 int CompareDevices(const void* a, const void* b) {
-  const Device* da = static_cast<const Device*>(a);
-  const Device* db = static_cast<const Device*>(b);
-
-  if (da->partition != db->partition) return db->partition - da->partition;
-  return strcmp(da->name, db->name);
+  return strcmp(static_cast<const Device*>(a)->name,
+                static_cast<const Device*>(b)->name);
 }
 
+/* One candidate per disk. A disk (sda) and its partitions (sda1, ...) are both
+ * in /sys/class/block, but a stick that carries a partition table cannot be
+ * mounted as a whole disk: mount(2) would read the partition table as if it
+ * were a filesystem, and the page then says the medium's format is not
+ * supported even though the filesystem inside the partition is. So when the
+ * first partition exists it stands in for the disk, and the whole disk is a
+ * candidate only when the stick has no partition table. */
 int ListDevices(Device* out, int max) {
   DIR* d = opendir(STORAGE_SYSFS "/class/block");
   struct dirent* ent;
@@ -320,17 +323,21 @@ int ListDevices(Device* out, int max) {
   while ((ent = readdir(d)) != nullptr) {
     const char* name = ent->d_name;
     size_t len = strlen(name);
-    int partition;
+    char first[24];
+    char path[256];
+    bool has_first;
 
     if (strncmp(name, "sd", 2) != 0) continue;
-    if (len < 3 || len >= sizeof out[0].name) continue;
-    if (name[2] < 'a' || name[2] > 'z') continue;
-    partition = len > 3;
-    if (partition && (name[3] < '0' || name[3] > '9')) continue;
+    /* Exactly sda is a disk; sda1 and longer is one of its partitions, which
+     * is reached through the disk's own entry here. */
+    if (len != 3 || name[2] < 'a' || name[2] > 'z') continue;
     if (n >= max) break;
 
-    memcpy(out[n].name, name, len + 1);
-    out[n].partition = partition;
+    snprintf(first, sizeof first, "%.3s1", name);
+    snprintf(path, sizeof path, "%s/class/block/%.80s", STORAGE_SYSFS, first);
+    has_first = access(path, F_OK) == 0;
+    memcpy(out[n].name, has_first ? first : name,
+           (has_first ? strlen(first) : len) + 1);
     ++n;
   }
   closedir(d);
@@ -363,7 +370,12 @@ int DetectFs(const char* node, char* fs, size_t cap, const char** why) {
     *why = "EXFAT NOT SUPPORTED";
     return -1;
   }
-  if (boot[54] == 'F' && boot[55] == 'A' && boot[56] == 'T') {
+  /* The FAT type label sits at 0x36 on FAT12/16 and at 0x52 on FAT32, where
+   * 0x36 is reserved and reads as zero. Looking only at 0x36 refused every
+   * FAT32 volume — the format a partitioned stick almost always carries — and
+   * the page then said FORMAT NOT SUPPORTED about a stick that mounts fine. */
+  if ((boot[54] == 'F' && boot[55] == 'A' && boot[56] == 'T') ||
+      (boot[82] == 'F' && boot[83] == 'A' && boot[84] == 'T')) {
     snprintf(fs, cap, "vfat");
     return 0;
   }

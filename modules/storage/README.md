@@ -111,8 +111,15 @@ userfs the daemon is running on.
 
 - FAT and ext4 are read from the medium and mounted. exFAT and NTFS are not in
   the kernel and are refused by name.
+- A stick with a partition table is mounted through its first partition
+  (`/dev/sdX1`). A stick formatted without one (a superfloppy) is mounted as
+  the whole disk. A disk that has a partition table is never mounted whole:
+  `mount(2)` would read the partition table as the filesystem.
 - One stick, one mount point. The host port supplies 5 V at 200 mA, so the
-  stick must be one the controller can power directly; hubs are not supported.
+  stick must be one the controller can power directly.
+- Hubs are refused by the kernel: the live kernel is built with
+  `CONFIG_USB_OTG_BLACKLIST_HUB`, and the log says `ignoring external hub`. A
+  powered hub still has no ports. Plug the stick directly.
 - A vfat mount is not journalled. Pulling the stick while the daemon is writing
   to `Programs/` can lose the last write.
 - The switch closes the daemon's descriptors, as every borg switch does. Audio
@@ -128,8 +135,9 @@ userfs the daemon is running on.
 Builds the module for the development machine against a host that collects
 replies, with a scratch stick, a scratch mount table and a scratch userfs. It
 checks the listing, the sanitizer mirror (a session without the module, with a
-hidden file, with an unexpected entry), the wire and its silence about foreign
-traffic, and the page and its controls. `borg_reexec` is undefined there, so
-every switch path takes its refusal branch: nothing is mounted and nothing is
-written.
+hidden file, with an unexpected entry), the device list (a partitioned disk
+stands in as its first partition), the boot-sector format probe, the wire and
+its silence about foreign traffic, and the page and its controls.
+`borg_reexec` is undefined there, so every switch path takes its refusal
+branch: nothing is mounted and nothing is written.
 

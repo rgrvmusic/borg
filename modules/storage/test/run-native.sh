@@ -9,8 +9,9 @@
 # is made and nothing outside the scratch is touched. borg_reexec is left
 # undefined, which makes every switch path take its refusal branch.
 #
-# What this cannot reproduce is the switch itself and the panel. The session
-# check, the mountinfo parser, the wire and the page are the code that ships.
+# What this cannot reproduce is the switch itself and the panel. The device
+# list, the format probe, the session check, the mountinfo parser, the wire and
+# the page are the code that ships.
 
 set -e
 
@@ -28,10 +29,12 @@ DEFS=(
     "-DSTORAGE_DEV=\"$SCRATCH/dev\""
 )
 
+# The module is included by native_test.cc, not compiled beside it, so the
+# device list and the boot-sector probe are reachable by name.
 "${CXX:-g++}" -std=c++14 -O1 -g -Wall -Wextra \
     -I"$ROOT/libborg" \
     "${DEFS[@]}" \
     -o "$SCRATCH/native_test" \
-    "$HERE/native_test.cc" "$HERE/../storage.cc"
+    "$HERE/native_test.cc"
 
 "$SCRATCH/native_test" "$SCRATCH"

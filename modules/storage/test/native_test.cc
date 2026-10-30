@@ -5,10 +5,12 @@
  * The module is built here for this machine against a host whose midi_write
  * collects bytes instead of writing a rawmidi node. The mount table is a file
  * in the scratch directory, so the module believes a stick is mounted without
- * a mount(2) being made, and the stick itself is a scratch directory. The code
- * that ships is what runs: the mountinfo parser, the session listing, the
- * sanitizer mirror that decides whether a session is safe to switch to, the
- * wire, and the page.
+ * a mount(2) being made, and the stick itself is a scratch directory. The
+ * source is included rather than linked so the device list and the boot-sector
+ * probe can be called directly; both only read the scratch tree, and no
+ * mount(2) is made. The code that ships is what runs: the mountinfo parser,
+ * the device list, the format probe, the session listing, the sanitizer mirror
+ * that decides whether a session is safe to switch to, the wire, and the page.
  *
  * What it cannot reproduce is the switch. borg_reexec is weak and undefined
  * here, which is exactly the state a module is in when the resident object
@@ -20,6 +22,9 @@
  * passes the STORAGE_* paths as overrides. The scratch directory is argv[1].
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -35,6 +40,11 @@
 #include <vector>
 
 #include "borg_module.h"
+
+/* The module itself, in this translation unit: ListDevices and DetectFs are
+ * what the new device handling is, and neither is reachable through the module
+ * interface without a mount(2). */
+#include "../storage.cc"
 
 namespace {
 
@@ -291,6 +301,34 @@ bool LayoutScratch() {
     return false;
   }
 
+  /* The sysfs and /dev view the device list reads: sda with a partition table
+   * and one partition, and sdb without one. sda1 carries a FAT32 volume, whose
+   * type label is at 0x52 and not at 0x36. */
+  const std::string blocks = s + "/sys/class/block";
+  const std::string dev = s + "/dev";
+  const std::string nodes[] = {blocks + "/sda", blocks + "/sda1",
+                               blocks + "/sdb", dev};
+  for (size_t i = 0; i < sizeof nodes / sizeof nodes[0]; ++i) {
+    if (!MakeDirs(nodes[i])) return false;
+  }
+
+  std::string mbr(4096, '\0');
+  mbr[446 + 4] = '\x0b';  /* one FAT32 partition, type 0x0b, at LBA 2048 */
+  std::string fat32(4096, '\0');
+  memcpy(&fat32[3], "MSWIN4.1", 8);
+  memcpy(&fat32[82], "FAT32   ", 8);
+  fat32[510] = '\x55';
+  fat32[511] = '\xaa';
+  std::string fat16(4096, '\0');
+  memcpy(&fat16[3], "MSWIN4.1", 8);
+  memcpy(&fat16[54], "FAT16   ", 8);
+  fat16[510] = '\x55';
+  fat16[511] = '\xaa';
+  if (!WriteFile(dev + "/sda", mbr) || !WriteFile(dev + "/sda1", fat32) ||
+      !WriteFile(dev + "/sdb", fat16)) {
+    return false;
+  }
+
   /* A stick mount and, at first, no userfs mount. The parser reads the root
    * field of a line, so nothing here has to be a real mount. */
   return WriteFile(s + "/mountinfo",
@@ -312,6 +350,32 @@ bool MarkActive() {
 }
 
 /* ------------------------------------------------------------------ tests */
+
+void TestDevices() {
+  const std::string s = g_scratch;
+  Device devs[16];
+  char fs[16];
+  const char* why = "";
+  const int n = ListDevices(devs, 16);
+
+  Check(n == 2, "one candidate per disk");
+  Check(n == 2 && std::string(devs[0].name) == "sda1",
+        "a partitioned stick is offered as its first partition");
+  Check(n == 2 && std::string(devs[1].name) == "sdb",
+        "a stick without a partition table is offered whole");
+
+  Check(DetectFs((s + "/dev/sda1").c_str(), fs, sizeof fs, &why) == 0 &&
+            strcmp(fs, "vfat") == 0,
+        "a FAT32 partition is recognised as vfat");
+  Check(DetectFs((s + "/dev/sdb").c_str(), fs, sizeof fs, &why) == 0 &&
+            strcmp(fs, "vfat") == 0,
+        "a FAT16 whole disk is recognised as vfat");
+
+  /* The disk's partition table is not a filesystem, so offering the disk as
+   * well as its first partition would only add a guaranteed failure. */
+  Check(DetectFs((s + "/dev/sda").c_str(), fs, sizeof fs, &why) != 0,
+        "a partition table is not mistaken for a filesystem");
+}
 
 void TestWire(const borg_module* m) {
   std::string raw;
@@ -522,6 +586,7 @@ int main(int argc, char** argv) {
             m->encoder != NULL && m->tick != NULL,
         "the callbacks are present");
 
+  TestDevices();
   TestWire(m);
   TestForeign(m);
   TestPage(m);
