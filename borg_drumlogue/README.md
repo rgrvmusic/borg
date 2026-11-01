@@ -388,8 +388,89 @@ for longer lines, at most 25 characters across the screen. The panel stops
 drawing a text run at a comma, so use a space instead. The tab title is cut to
 7 characters.
 
+### A unit's off-audio work
+
+A page draw is not a heartbeat: it only runs while the page is selected. A unit
+that has to poll something — a rawmidi node, a helper's answer — asks for the
+same pulse the modules get, from the same two places:
+
+```c++
+static void unit_tick(void*) {
+  /* Bounded and non-blocking: open/read/write a non-blocking fd, a few
+   * bytes. No file I/O on a pulse that has nothing to do. */
+}
+
+// In unit_init, beside the page registration:
+if (borg_unit_set_tick != nullptr)
+  borg_unit_set_tick(&s_desc, unit_tick, nullptr);
+
+// In unit_teardown, before freeing what the tick touches:
+if (borg_unit_set_tick != nullptr)
+  borg_unit_set_tick(&s_desc, nullptr, nullptr);
+```
+
+`borg_unit_set_tick` takes the same static descriptor as the page, and
+unregistering the page removes the tick as well. It is called on the panel
+thread, about **2 Hz** at rest, and once more after every `snd_rawmidi_read`.
+That is a pulse, not a schedule: the host holds one tick at a time and skips
+one that arrives while the previous is still running, so every visit must
+return. The audio callbacks remain the wrong place for device I/O, whatever the
+tick makes possible.
+
+**2 Hz is the panel's cadence, not a rate for driving hardware.** It is right
+for a page that shows a state, and for a node that has nothing to do; it is far
+too slow for a device that is itself redrawn at 50 Hz — half a second per
+update reads as a flicker, not as motion. A unit that needs a real frame rate
+(`firetracker_borg` driving an Akai Fire is the case) creates a `pthread` of
+its own with a CLOCK_MONOTONIC deadline, parks it from `unit_suspend`, joins it
+at the start of `unit_teardown`, and registers the borg tick *only* as the
+fallback for a host where the thread cannot be created — never both at once.
+Know what that costs: a unit's thread is an ordinary one, `SCHED_OTHER` at nice
+0, competing with the playback thread exactly as the scheduling section above
+describes, and borg's answer there is to promote the audio thread rather than
+to slow the unit down. Keep each visit as bounded as a tick, and keep file I/O
+to one load per state change.
+
+A *one-off* load on a state change — parsing a file that was just selected, the
+way `firetracker_borg` builds its song model — is the exception. It must happen
+at most once per change and never on a pulse that has nothing to do; the trylock
+is then what turns a long visit into one missed pulse rather than a backlog.
+
 Only one page is offered per registered unit, and up to four units can be
 registered. Unit pages sit after STATUS and MIDI; module pages follow them.
+
+### A unit's MIDI
+
+`borg_unit_host` ABI 2 lets a unit receive SysEx and answer it. A unit cannot
+open a port itself: the daemon holds the USB gadget and both DIN sockets, and
+borg already sits on every read. The unit asks for a prefix and is handed each
+complete message that starts with it, on the daemon's MIDI thread, with the
+output paired with the port it arrived on:
+
+```c++
+static void on_sysex(void* port, const uint8_t* data, unsigned n, void*) {
+  /* Copy into a ring and return. The tick consumes the ring. */
+}
+
+const borg_unit_host* host = borg_unit_host_get(2);
+if (host != nullptr && host->midi_subscribe != nullptr) {
+  static const uint8_t kPrefix[3] = {0xF0, 0x7D, 0x03};
+  int token = host->midi_subscribe(kPrefix, 3, on_sysex, nullptr);
+}
+```
+
+The prefix is the unit's filter. `0x7D` is shared by every borg user, so a
+unit that asks for `F0 7D` alone is offered electrik's traffic and the modules'
+too. The callback runs serialized with the modules' `midi_in` and must only
+copy. `midi_unsubscribe` returns after an in-flight callback has finished, so
+the ring may be freed when it returns. A unit built against ABI 2 falls back to
+`borg_unit_host_get(1)` on an older borg and loses MIDI, not its page.
+
+`midi_try_write` is the answer, and it never waits: it returns the bytes taken,
+or a negative errno such as `-EAGAIN`. The unit keeps the unsent part and
+resumes from that offset on its next tick. Waiting for a full USB output on the
+daemon's MIDI thread, or on the audio thread, is the one thing this API exists
+to avoid.
 
 
 ## Logs

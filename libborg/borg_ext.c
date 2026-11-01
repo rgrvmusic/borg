@@ -79,6 +79,40 @@ extern char** environ;
 #define KEY_PAGE_UP 0x20
 #define KEY_MUTE 0x22
 
+/* The transport keys, for a unit that leads the drumlogue (borg_unit.h, the
+ * transport services). They are NOT measured yet, so transport_key_known is 0
+ * and transport_request() refuses: a wrong guess that lands on a drum pad
+ * would sound a part on an instrument the user did not ask to hear, and a
+ * refusal is the only safe answer to an index nobody has read. They are read
+ * through last_key() -- open the menu, press PLAY, read the index in the log
+ * -- and filled in here. Measured, not inferred; the four above cost the same
+ * exercise. */
+static unsigned char key_play;
+static unsigned char key_stop;
+static int transport_key_known;
+
+/* A key press asked for by a unit, delivered on the next panel report. It is
+ * held as index + 1 so that zero means "nothing pending" without a second
+ * flag, and the release waits for the following report: the panel reports at
+ * 2 Hz, so the daemon sees a half-second press rather than a down and an up
+ * that it may read in the same buffer and coalesce. */
+static int inject_key;
+static int inject_release;
+
+/* The last key borg saw, for a unit measuring the indices it needs. The panel
+ * thread writes it and the tick reads it, both on the panel thread; the atomic
+ * is for a unit that asks from a thread of its own. */
+static int last_key_index = -1;
+static int last_key_down;
+
+/* The daemon's timing clock: the last instant an F8 was written to any of its
+ * MIDI outputs, and how many such bytes have been seen. Zero means none has
+ * been seen at all, which is a different answer from "stopped" and must stay
+ * different -- a unit that follows would otherwise stop a song because the
+ * device had not started its own sequencer yet. */
+static unsigned long long midi_clock_last_ms;
+static unsigned long midi_clock_bytes;
+
 static int panel_fds[PANEL_FDS_MAX];
 static int n_panel_fds;
 static int panel_out_fd = -1;
@@ -786,6 +820,10 @@ void borg_unit_unregister(const borg_unit_desc* desc) {
   int found = 0;
 
   if (desc == NULL) return;
+  /* The tick is keyed by the same desc, and the desc is about to stop being
+   * valid. Drop it before the page, so a teardown cannot leave a pulse
+   * pointing at a static object the unit has finished with. */
+  borg_unit_set_tick(desc, NULL, NULL);
   next = unit_set_copy();
   if (next == NULL) return;
   for (i = 0; i < next->n; i++) {
@@ -808,6 +846,178 @@ void borg_unit_unregister(const borg_unit_desc* desc) {
     return;
   }
   __atomic_store_n(&unit_set_live, next, __ATOMIC_RELEASE);
+}
+
+/* ------------------------------------------------------------ the unit ticks
+ *
+ * A unit's audio callbacks cannot touch a device: a read from a stalled USB
+ * endpoint is a dropout for exactly as long as the endpoint takes. What a unit
+ * needs instead is somewhere that is neither the audio thread nor a thread of
+ * its own. The host already has one: the panel thread already calls the
+ * modules' tick on every panel report, and the MIDI input path already calls
+ * it on every read. A unit gets the same pulse from the same two places.
+ *
+ * It is keyed by the page descriptor rather than put into borg_unit_desc
+ * because the descriptor is ABI 1 and a unit built against it must keep
+ * loading. A unit that does not want a page still has a static desc to use as
+ * the key; unregistering the page also removes the tick.
+ *
+ * Same publication rule as the page set: a new immutable array is published
+ * and the old one is left allocated, because a pulse may already be walking
+ * it. A pulse that arrives while one is still running is skipped by the
+ * trylock -- it is a heartbeat, not a queue, and the next report is half a
+ * second away. */
+
+typedef struct unit_tick_entry {
+  const borg_unit_desc* desc;
+  void (*tick)(void* user);
+  void* user;
+} unit_tick_entry;
+
+typedef struct unit_tick_set {
+  int n;
+  unit_tick_entry entry[UNIT_MAX];
+} unit_tick_set;
+
+static unit_tick_set* unit_tick_live;
+
+static pthread_mutex_t unit_call_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unit_tick_set* unit_tick_copy(void) {
+  const unit_tick_set* cur = __atomic_load_n(&unit_tick_live, __ATOMIC_ACQUIRE);
+  unit_tick_set* next = (unit_tick_set*)malloc(sizeof *next);
+
+  if (next == NULL) return NULL;
+  if (cur != NULL) {
+    *next = *cur;
+  } else {
+    next->n = 0;
+  }
+  return next;
+}
+
+int borg_unit_set_tick(const borg_unit_desc* desc,
+                       void (*tick)(void* user), void* user) {
+  unit_tick_set* next;
+  int i, j;
+
+  if (desc == NULL) return -1;
+  next = unit_tick_copy();
+  if (next == NULL) return -1;
+
+  for (i = 0; i < next->n; i++) {
+    if (next->entry[i].desc != desc) continue;
+    if (tick == NULL) {
+      for (j = i + 1; j < next->n; j++) next->entry[j - 1] = next->entry[j];
+      next->n--;
+    } else {
+      next->entry[i].tick = tick;
+      next->entry[i].user = user;
+    }
+    if (next->n == 0) {
+      __atomic_store_n(&unit_tick_live, NULL, __ATOMIC_RELEASE);
+      free(next);
+    } else {
+      __atomic_store_n(&unit_tick_live, next, __ATOMIC_RELEASE);
+    }
+    return 0;
+  }
+
+  if (tick == NULL) {
+    /* Removing something that was never there is not a failure. */
+    free(next);
+    return 0;
+  }
+  if (next->n >= UNIT_MAX) {
+    free(next);
+    return -1;
+  }
+  next->entry[next->n].desc = desc;
+  next->entry[next->n].tick = tick;
+  next->entry[next->n].user = user;
+  next->n++;
+  __atomic_store_n(&unit_tick_live, next, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static void units_tick(void) {
+  const unit_tick_set* set =
+      __atomic_load_n(&unit_tick_live, __ATOMIC_ACQUIRE);
+  int i;
+
+  if (set == NULL) return;
+  if (pthread_mutex_trylock(&unit_call_lock) != 0) return;
+  for (i = 0; i < set->n; i++) {
+    if (set->entry[i].tick != NULL) set->entry[i].tick(set->entry[i].user);
+  }
+  pthread_mutex_unlock(&unit_call_lock);
+}
+
+/* ------------------------------------------------------ transport services
+ *
+ * The two observations borg can offer a unit (borg_unit.h): the daemon's
+ * clock on its way out, and the panel keys on their way in. Neither is the
+ * daemon's transport; together they are enough for a unit to follow it or to
+ * press its keys, and which of those a unit does is its own decision.
+ */
+
+/* At 24 ppqn even a slow song sends clock every 100 ms or so, so 400 ms of
+ * silence is a stop and not a gap between ticks. The window is generous
+ * because the panel and MIDI threads are the real-time paths and a delayed
+ * write must not read as a stopped sequencer. */
+#define TRANSPORT_CLOCK_WINDOW_MS 400u
+
+static int borg_transport(void) {
+  unsigned long long last;
+
+  if (__atomic_load_n(&midi_clock_bytes, __ATOMIC_RELAXED) == 0) return -1;
+  last = __atomic_load_n(&midi_clock_last_ms, __ATOMIC_RELAXED);
+  if (last == 0) return -1;
+  return pcm_now_ms() - last <= TRANSPORT_CLOCK_WINDOW_MS ? 1 : 0;
+}
+
+static int borg_request_transport(int running) {
+  const unsigned char key = running ? key_play : key_stop;
+
+  /* No key index has been measured on this build, so there is nothing safe to
+   * press. See the note at key_play. */
+  if (!transport_key_known) return -1;
+  /* The menu suppresses every key, so a press asked for now would be eaten. */
+  if (menu_open) return -1;
+  if (panel_out_fd < 0) return -1;
+  /* One press in flight already: its release has not gone out. Pressing the
+   * opposite key now would deliver the two back to back and the daemon would
+   * see a transport toggled twice. */
+  if (__atomic_load_n(&inject_key, __ATOMIC_ACQUIRE) != 0 ||
+      __atomic_load_n(&inject_release, __ATOMIC_ACQUIRE) != 0)
+    return -2;
+  __atomic_store_n(&inject_key, (int)key + 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static int borg_last_key(int* down) {
+  if (down != NULL)
+    *down = __atomic_load_n(&last_key_down, __ATOMIC_RELAXED);
+  return __atomic_load_n(&last_key_index, __ATOMIC_RELAXED);
+}
+
+/* ABI 2. Defined with the MIDI ports below; the host table is built here. */
+static int borg_unit_midi_subscribe(const uint8_t* prefix, unsigned prefix_len,
+                                    borg_unit_midi_fn in, void* user);
+static void borg_unit_midi_unsubscribe(int token);
+static int borg_unit_midi_try_write(void* port, const void* data, size_t n);
+static const char* borg_unit_port_name(void* port);
+
+static const borg_unit_host unit_host_services = {
+  (uint32_t)sizeof(borg_unit_host), BORG_UNIT_HOST_ABI,
+  borg_transport, borg_request_transport, borg_last_key,
+  borg_unit_midi_subscribe, borg_unit_midi_unsubscribe,
+  borg_unit_midi_try_write, borg_unit_port_name
+};
+
+const borg_unit_host* borg_unit_host_get(uint32_t abi) {
+  if (abi == 0 || abi > BORG_UNIT_HOST_ABI) return NULL;
+  return &unit_host_services;
 }
 
 static int unit_count(void) {
@@ -1822,6 +2032,14 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
       frame[1] = key;
       frame[2] = raw;
 
+      /* Every key is recorded, menu or not: this is how a unit measures the
+       * indices borg does not name itself (borg_unit.h, last_key). With the
+       * menu open it is also logged, because that is the state in which a key
+       * cannot reach the daemon -- the safe way to learn what PLAY is. */
+      __atomic_store_n(&last_key_index, (int)key, __ATOMIC_RELAXED);
+      __atomic_store_n(&last_key_down, down ? 1 : 0, __ATOMIC_RELAXED);
+      if (menu_open) module_logf("key %02x %s", (unsigned)key, down ? "down" : "up");
+
       if (held_valid) {
         if (down && chord_partner(held_key, key)) {
           /* The partner: the gesture was a chord, so the held down and this
@@ -1929,12 +2147,42 @@ static size_t panel_scan(int fd, unsigned char* buf, size_t got, size_t cap) {
   /* The panel reports at 2 Hz even when no key moves. The tick does a module's
    * waiting work first, so the page drawn below is the state after it, and the
    * page redraw keeps a unit or module page following playback. Both run on the
-   * panel thread. */
+   * panel thread. A unit's tick runs first and from the same pulse: the page
+   * it draws below is then the state after its own device work. */
+  units_tick();
   modules_tick();
   /* Outside the menu on purpose: the audio path is observed while the user is
    * playing, which is when the menu is closed. */
   audio_diag_log();
   if (menu_open) page_redraw();
+
+  /* A transport press a unit asked for (borg_unit.h, transport_request) is
+   * appended here rather than synthesized into the read we just scanned: it
+   * must not pass through borg's own key handling, which would treat PLAY as
+   * a page key. Down on this report and the release on the next one is the
+   * ~500 ms press the panel itself produces, and is why the request only
+   * records an index and the release is keyed off it. The menu is rechecked
+   * here: it may have opened between the request and this report, and a key
+   * pressed with the menu open is suppressed a few lines above. The room check
+   * includes the caller's buffer, not just ours: a press that is appended but
+   * then discarded because the daemon's read was a full one has to stay
+   * pending, exactly as a held chord key does below. */
+  if (!menu_open && o + 6 <= sizeof out && o + 6 <= cap) {
+    const int release = __atomic_load_n(&inject_release, __ATOMIC_ACQUIRE);
+    const int pending = __atomic_load_n(&inject_key, __ATOMIC_ACQUIRE);
+    if (release != 0) {
+      out[o++] = 0x80;
+      out[o++] = (unsigned char)(release - 1);
+      out[o++] = 0x00;
+      __atomic_store_n(&inject_release, 0, __ATOMIC_RELEASE);
+    } else if (pending != 0) {
+      out[o++] = 0x80;
+      out[o++] = (unsigned char)(pending - 1);
+      out[o++] = 0x01;
+      __atomic_store_n(&inject_release, pending, __ATOMIC_RELEASE);
+      __atomic_store_n(&inject_key, 0, __ATOMIC_RELEASE);
+    }
+  }
 
   if (o <= cap) {
     memcpy(buf, out, o);
@@ -2329,6 +2577,104 @@ static const char* host_port_name(void* port) {
   return name;
 }
 
+/* ------------------------------------------------------------- unit MIDI
+ *
+ * borg_unit.h ABI 2. A unit is offered the complete SysEx messages whose
+ * prefix it asks for, on the daemon's MIDI thread, and answers on the paired
+ * output. The table is fixed and read under a lock the callback also holds, so
+ * unsubscribe returns only after a callback already running has finished and
+ * the unit may free its ring.
+ *
+ * The callback must copy and return. A unit's tick consumes what it copied;
+ * nothing that blocks belongs on the daemon's MIDI thread. */
+#define UNIT_MIDI_MAX 4
+#define UNIT_MIDI_PREFIX_MAX 8
+
+typedef struct unit_midi_sub {
+  int used;
+  unsigned prefix_len;
+  uint8_t prefix[UNIT_MIDI_PREFIX_MAX];
+  borg_unit_midi_fn in;
+  void* user;
+} unit_midi_sub;
+
+static unit_midi_sub unit_midi_subs[UNIT_MIDI_MAX];
+static pthread_mutex_t unit_midi_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int borg_unit_midi_subscribe(const uint8_t* prefix, unsigned prefix_len,
+                                    borg_unit_midi_fn in, void* user) {
+  int i, token = -1;
+
+  if (prefix == NULL || in == NULL || prefix_len == 0 ||
+      prefix_len > UNIT_MIDI_PREFIX_MAX)
+    return -1;
+
+  pthread_mutex_lock(&unit_midi_lock);
+  for (i = 0; i < UNIT_MIDI_MAX; i++) {
+    if (unit_midi_subs[i].used) continue;
+    unit_midi_subs[i].used = 1;
+    unit_midi_subs[i].prefix_len = prefix_len;
+    memcpy(unit_midi_subs[i].prefix, prefix, prefix_len);
+    unit_midi_subs[i].in = in;
+    unit_midi_subs[i].user = user;
+    token = i + 1;
+    break;
+  }
+  pthread_mutex_unlock(&unit_midi_lock);
+  return token;
+}
+
+static void borg_unit_midi_unsubscribe(int token) {
+  if (token < 1 || token > UNIT_MIDI_MAX) return;
+  pthread_mutex_lock(&unit_midi_lock);
+  memset(&unit_midi_subs[token - 1], 0, sizeof unit_midi_subs[0]);
+  pthread_mutex_unlock(&unit_midi_lock);
+}
+
+static void units_midi_in(void* port, const unsigned char* data, size_t n) {
+  int i;
+
+  if (data == NULL || n == 0) return;
+  pthread_mutex_lock(&unit_midi_lock);
+  for (i = 0; i < UNIT_MIDI_MAX; i++) {
+    const unit_midi_sub* s = &unit_midi_subs[i];
+    if (!s->used || s->in == NULL || n < s->prefix_len) continue;
+    if (memcmp(data, s->prefix, s->prefix_len) != 0) continue;
+    s->in(port, data, (unsigned)n, s->user);
+  }
+  pthread_mutex_unlock(&unit_midi_lock);
+}
+
+/* A reply is small and the port was opened non-blocking, so one call answers
+ * with what it took. The caller keeps the unsent part and resumes on its next
+ * tick; waiting here would hold the daemon's MIDI thread. */
+static int borg_unit_midi_try_write(void* port, const void* data, size_t n) {
+  snd_rawmidi_t* out = NULL;
+  ssize_t put;
+  int i;
+
+  if (port == NULL || (data == NULL && n > 0)) return -1;
+  if (n == 0) return 0;
+
+  pthread_mutex_lock(&midi_ports_lock);
+  for (i = 0; i < n_midi_ports; i++) {
+    if (midi_ports[i].input == (snd_rawmidi_t*)port) {
+      out = midi_ports[i].output;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&midi_ports_lock);
+  if (out == NULL) return -1;
+
+  put = snd_rawmidi_write(out, data, n);
+  if (put < 0) return errno != 0 ? -errno : -1;
+  return (int)put;
+}
+
+static const char* borg_unit_port_name(void* port) {
+  return host_port_name(port);
+}
+
 static void midi_sysex_begin(void* port) {
   midi_sysex_len = 1;
   midi_sysex_buf[0] = 0xf0;
@@ -2350,6 +2696,7 @@ static void midi_sysex_end(void* port) {
     midi_sysex_buf[MIDI_SYSEX_MAX - 1] = 0xf7;
     midi_sysex_len = MIDI_SYSEX_MAX;
   }
+  units_midi_in(port, midi_sysex_buf, midi_sysex_len);
   modules_midi_in(port, midi_sysex_buf, midi_sysex_len);
   midi_sysex_len = 0;
   midi_sysex_port = NULL;
@@ -2497,7 +2844,9 @@ ssize_t snd_rawmidi_read(snd_rawmidi_t* rm, void* buf, size_t n) {
       midi_account((unsigned char*)buf, (size_t)got, rm);
       pthread_mutex_unlock(&midi_account_lock);
       /* A read is a pulse for a module that is waiting on something slow, such
-       * as the kernel's helper, so that its answer is picked up promptly. */
+       * as the kernel's helper, so that its answer is picked up promptly, and
+       * for a unit driving a device of its own on the same terms. */
+      units_tick();
       modules_tick();
     }
     return got;
@@ -2520,6 +2869,15 @@ ssize_t snd_rawmidi_write(snd_rawmidi_t* rm, const void* buf, size_t n) {
       midi_out_bytes += (unsigned long)put;
       for (i = 0; i < (size_t)put; i++) {
         if (p[i] >= 0x80 && p[i] < 0xf0) midi_out_msgs++;
+        /* Timing clock is the daemon saying its sequencer is running
+         * (borg_unit.h, transport). The drumlogue's own clock is not
+         * necessarily what is counted here -- a unit writing clock would too
+         * -- but the daemon writes it to every output while it runs and stops
+         * when it stops, which is the signal a follower needs. */
+        if (p[i] == 0xf8) {
+          midi_clock_bytes++;
+          __atomic_store_n(&midi_clock_last_ms, pcm_now_ms(), __ATOMIC_RELAXED);
+        }
       }
     }
     return put;

@@ -8,6 +8,10 @@
  * it finds and mounts the stick, and it binds one session's userfs onto the
  * directory the daemon expects.
  *
+ * WHEN IT MOUNTS. storage_init mounts the stick when borg loads the module at
+ * start, so a unit can use it without going through the userfs. A missing
+ * stick is retried by the tick every five seconds.
+ *
  * WHAT A SESSION IS. A directory on the stick:
  *
  *   borg/sessions/<name>/userfs/{Programs,Units,Samples,Kits}
@@ -48,6 +52,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
@@ -59,10 +64,10 @@ using borgwire::Reader;
 /* The paths this module uses. The overrides exist so a test can lay out a
  * scratch tree; the device build passes nothing. */
 #ifndef STORAGE_BASE
-#define STORAGE_BASE "/tmp/logue-borg"
+#define STORAGE_BASE "/tmp/borg-storage"
 #endif
 #ifndef STORAGE_STICK
-#define STORAGE_STICK STORAGE_BASE "/stick"
+#define STORAGE_STICK STORAGE_BASE
 #endif
 #ifndef STORAGE_USERFS
 #define STORAGE_USERFS "/var/lib/drumlogued/userfs"
@@ -92,7 +97,7 @@ constexpr int kRowY = 35;
 constexpr int kRowStep = 9;
 constexpr int kFileBudget = 20000;
 constexpr int kDepthMax = 6;
-constexpr int kRetryTicks = 10;
+constexpr int kRetrySeconds = 5;
 
 struct State {
   const borg_host* host = nullptr;
@@ -100,7 +105,9 @@ struct State {
 
   bool mounted = false;
   bool need_scan = false;
-  int retry = 0;
+  bool attempted = false;
+  bool hold = false;
+  struct timespec last_attempt = {0, 0};
 
   int count = 0;
   char session[kMaxSessions][kNameMax] = {{0}};
@@ -413,8 +420,7 @@ int MountStick() {
     return 0;
   }
 
-  if ((mkdir(STORAGE_BASE, 0755) != 0 && errno != EEXIST) ||
-      (mkdir(STORAGE_STICK, 0755) != 0 && errno != EEXIST)) {
+  if (mkdir(STORAGE_STICK, 0755) != 0 && errno != EEXIST) {
     SetError("CANNOT PREPARE");
     Logf("mkdir %s: %s", STORAGE_STICK, strerror(errno));
     return -1;
@@ -459,6 +465,7 @@ int UnmountStick() {
   }
   if (!IsMountPoint(STORAGE_STICK)) {
     g.mounted = false;
+    g.hold = true;
     g.count = 0;
     return 0;
   }
@@ -468,6 +475,8 @@ int UnmountStick() {
     return -1;
   }
   g.mounted = false;
+  /* An explicit release is not undone by the background retry. */
+  g.hold = true;
   g.count = 0;
   g.cursor = 0;
   g.first = 0;
@@ -477,9 +486,27 @@ int UnmountStick() {
 }
 
 int EnsureMounted() {
+  g.hold = false;
   if (g.mounted && IsMountPoint(STORAGE_STICK)) return 0;
   g.mounted = false;
   return MountStick();
+}
+
+/* Tick is also driven by MIDI reads, so pace the retry by the clock. */
+bool RetryDue() {
+  struct timespec now;
+
+  if (!g.attempted) return true;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
+  return now.tv_sec - g.last_attempt.tv_sec >= kRetrySeconds;
+}
+
+void MarkAttempt() {
+  if (clock_gettime(CLOCK_MONOTONIC, &g.last_attempt) != 0) {
+    g.last_attempt.tv_sec = 0;
+    g.last_attempt.tv_nsec = 0;
+  }
+  g.attempted = true;
 }
 
 /* ------------------------------------------------------------ the sessions */
@@ -979,7 +1006,6 @@ void storage_page_enter() {
    * earlier press is not left standing over a state that has moved on. */
   g.error[0] = '\0';
   g.need_scan = true;
-  g.retry = 0;
 }
 
 void storage_page_leave() {
@@ -1018,17 +1044,17 @@ void storage_encoder(int index, int delta) {
 void storage_tick() {
   if (g.need_scan) {
     g.need_scan = false;
+    MarkAttempt();
     if (EnsureMounted() == 0) {
       DetectActive();
       ScanSessions();
     }
-    g.retry = g.mounted ? 0 : kRetryTicks;
     return;
   }
 
-  if (!g.mounted && g.retry > 0) {
-    if (--g.retry == 0) g.need_scan = true;
-  }
+  /* Retry a missing stick with the menu closed. An explicit umount holds this
+   * off until something asks for the stick. */
+  if (!g.mounted && !g.hold && RetryDue()) g.need_scan = true;
 }
 
 /* --------------------------------------------------------------- the wire */
@@ -1198,14 +1224,15 @@ void storage_midi_in(void* port, const unsigned char* data, size_t n) {
 int storage_init(const borg_host* host, const char* module_path) {
   (void)module_path;
   g.host = host;
-  DetectActive();
-  g.mounted = IsMountPoint(STORAGE_STICK);
-  if (g.mounted) MountStick();  /* fills in the source and type */
-  /* Nothing is mounted on load. The stick is mounted when the page is entered
-   * or a wire request asks for it, so loading the module while a disk is
-   * plugged in does not start touching it. */
+  /* Mount now, when borg loads the module at start: a unit can use the stick
+   * without opening the page, and the session list is ready. The tick retries
+   * a missing stick. */
+  if (EnsureMounted() == 0) {
+    DetectActive();
+    ScanSessions();
+  }
+  MarkAttempt();
   g.need_scan = false;
-  g.retry = 0;
   Logf("storage module ready; %s", g.active[0] != '\0' ? "session active"
                                                         : "internal userfs");
   return 0;

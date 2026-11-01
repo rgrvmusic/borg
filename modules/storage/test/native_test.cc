@@ -275,7 +275,7 @@ std::string RowValue(const char* label) {
 
 bool LayoutScratch() {
   const std::string s = g_scratch;
-  const std::string sessions = s + "/base/stick/borg/sessions";
+  const std::string sessions = s + "/base/borg/sessions";
   const std::string dirs[] = {
       sessions + "/live/userfs/Programs",
       sessions + "/live/userfs/Units/Synths",
@@ -333,7 +333,7 @@ bool LayoutScratch() {
    * field of a line, so nothing here has to be a real mount. */
   return WriteFile(s + "/mountinfo",
                    "20 1 0:19 / / rw - tmpfs tmpfs rw\n"
-                   "36 1 8:0 / " + s + "/base/stick rw,nosuid,nodev - vfat "
+                   "36 1 8:0 / " + s + "/base rw,nosuid,nodev - vfat "
                    "/dev/sda rw\n");
 }
 
@@ -343,7 +343,7 @@ bool MarkActive() {
   const std::string s = g_scratch;
   return WriteFile(s + "/mountinfo",
                    "20 1 0:19 / / rw - tmpfs tmpfs rw\n"
-                   "36 1 8:0 / " + s + "/base/stick rw,nosuid,nodev - vfat "
+                   "36 1 8:0 / " + s + "/base rw,nosuid,nodev - vfat "
                    "/dev/sda rw\n"
                    "99 36 8:0 /borg/sessions/live/userfs " + s +
                        "/userfs rw,nosuid,nodev - vfat /dev/sda rw\n");
@@ -582,6 +582,8 @@ int main(int argc, char** argv) {
   Check((m->capabilities & BORG_CAP_INPUT) != 0, "the module asks for input");
 
   Check(m->init(&g_host, "/scratch/storage.borgmodule") == 0, "init succeeds");
+  Check(g.mounted, "init mounts the stick");
+  Check(g.count == 4, "init loads the session list");
   Check(m->page_draw != NULL && m->midi_in != NULL && m->key != NULL &&
             m->encoder != NULL && m->tick != NULL,
         "the callbacks are present");

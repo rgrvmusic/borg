@@ -45,6 +45,14 @@ the borg unit are strongly recommended for the same reason. The module does not
 add them to the session for you.
 
 
+## For units
+
+The stick is mounted at `/tmp/borg-storage` when the module loads at daemon
+start. A unit can read and write the whole tree there, including
+`borg/sessions/`, without opening the storage page or going through the userfs.
+The mount is transient and gone at the next power cycle.
+
+
 ## On the panel
 
 Hold MUTE and press MASTER, then PAGE UP or PAGE DOWN until `STORAGE` is the
@@ -64,8 +72,10 @@ keys. Returning to the internal userfs is the same gesture on the row marked
 The top row shows `STICK:`. When something failed its value is the reason, such
 as `NO MODULE`, `NO STICK`, `MOUNT DENIED` or `NO RELOAD`; `READING` while the
 stick is being tested. `ACTIVE` marks the session the daemon is running on. The
-page retries the stick when it is opened and every five seconds after a failed
-attempt, so a stick inserted later appears without leaving the page.
+stick is mounted when the module loads at start; a missing stick is retried in
+the background every five seconds. Opening the page rechecks it immediately. An
+explicit `@storage umount` is left alone until the page or a wire request asks
+for the stick again.
 
 `NO MODULE` means the highlighted session has no `Programs/storage.borgmodule`.
 Copy it, and the exec module and the borg unit, into that session's userfs
