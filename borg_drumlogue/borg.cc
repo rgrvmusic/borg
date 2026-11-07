@@ -97,7 +97,7 @@ const char* PhaseBody() {
     case kActive:    return "EXTENSIONS LOADED";
     case kFailed:    return "NOTHING CHANGED";
     case kReady:
-    default:         return "PRESS A PAD";
+    default:         return "PRESS USER TO START";
   }
 }
 

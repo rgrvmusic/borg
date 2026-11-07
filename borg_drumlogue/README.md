@@ -37,7 +37,7 @@ Output: `bin/borg.drmlgunit`.
 
 | STATE | Screen | Meaning |
 |---|---|---|
-| `!ready` | `BORG READY` / `PRESS A PAD` | waiting for `GateOn()` |
+| `!ready` | `BORG READY` / `PRESS USER TO START` | waiting for `GateOn()` |
 | `!switch` | `BORG SWITCHING` / `LOADING EXTENSIONS` | switch in progress |
 | `!active` | `BORG ACTIVE` / `EXTENSIONS LOADED` | the object is loaded; gates are ignored |
 | `!err` | `BORG FAILED` / `NOTHING CHANGED` | the switch was refused; the daemon is unchanged |
