@@ -472,6 +472,10 @@ resumes from that offset on its next tick. Waiting for a full USB output on the
 daemon's MIDI thread, or on the audio thread, is the one thing this API exists
 to avoid.
 
+ABI 3 adds the analog voice link: write, read and claim on the daemon's own
+`/dev/ttymxc1`, so a unit can fill a transient slot on GateOn and keep the
+daemon's preload from overwriting it.
+
 
 ## Logs
 

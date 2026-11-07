@@ -136,7 +136,11 @@ BORG_UNIT_WEAK int borg_unit_set_tick(const borg_unit_desc* desc,
  * borg's text wire (wire.h, 0x3E) and the modules' traffic are unaffected. A
  * unit built against ABI 2 asks for 2 and falls back to get(1) when an older
  * borg is present; the fallback loses MIDI, not the page or the transport. */
-#define BORG_UNIT_HOST_ABI 2u
+/* ABI 3 appends the analog voice link, so a unit that wants only MIDI asks
+ * for 2 and keeps working. */
+#define BORG_UNIT_HOST_ABI 3u
+#define BORG_UNIT_HOST_ABI_MIDI 2u
+#define BORG_UNIT_HOST_ABI_VOICE 3u
 
 /* ABI 2. Complete SysEx, F0 through F7 inclusive. `port` is the paired output
  * handle and is opaque to the unit. */
@@ -185,6 +189,16 @@ typedef struct borg_unit_host {
   /* ABI 2. The name the daemon opened the port with, such as `hw:2,0,0`, or an
    * empty string. The pointer stays valid while the daemon runs. */
   const char* (*port_name)(void* port);
+  /* ABI 3. The daemon's voice link, /dev/ttymxc1. The daemon owns the port,
+   * so borg writes through its fd and taps the replies. `voice_write` queues
+   * every byte and returns the count, or a negative errno; `voice_read` never
+   * blocks and is byte oriented. */
+  int (*voice_write)(const void* data, size_t n);
+  int (*voice_read)(void* data, size_t n);
+  /* ABI 3. Keep the daemon's preload from overwriting one transient slot. borg
+   * drops its complete 0x81 frames for the slot and answers them itself. A
+   * negative bank or slot releases. Process-wide, one slot at a time. */
+  int (*voice_claim)(int bank, int slot);
 } borg_unit_host;
 
 /* NULL when borg is not in this process, or when it speaks a lower interface

@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <link.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -59,6 +60,8 @@ extern char** environ;
 #endif
 
 #define PANEL_FDS_MAX 8
+/* The board's replies are two bytes each: room for a whole slot's worth. */
+#define VOICE_RING_MAX 512
 #define CAPTURE_MAX 8192
 #define MODULE_MAX 8
 #define MODULE_FILE_MAX 96
@@ -116,6 +119,20 @@ static unsigned long midi_clock_bytes;
 static int panel_fds[PANEL_FDS_MAX];
 static int n_panel_fds;
 static int panel_out_fd = -1;
+
+/* The daemon's voice fd and the replies seen on it. A second reader would race
+ * the daemon for them, so they are copied out instead. */
+static int voice_fd = -1;
+static unsigned char voice_ring[VOICE_RING_MAX];
+static unsigned voice_ring_head;
+static unsigned voice_ring_tail;
+
+/* The claimed bank/slot byte, or -1, and the synthetic F1 00 answers it earns
+ * so the daemon's preload does not stall. */
+static int voice_claim_byte = -1;
+static unsigned char voice_synth[512];
+static unsigned voice_synth_head;
+static unsigned voice_synth_tail;
 
 static int menu_open;
 static int menu_page;
@@ -587,6 +604,202 @@ static void panel_del(int fd) {
   if (n_panel_fds == 0) panel_reset();
 }
 
+/* ---------------------------------------------------------------- the voice */
+
+static int path_is_voice(const char* path) {
+  return path != NULL && strstr(path, "ttymxc1") != NULL;
+}
+
+/* Keeps the daemon's reads and a unit's drain from taking the same reply. */
+static pthread_mutex_t voice_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A full ring drops the new bytes; the next upload asks again. */
+static void voice_tap(const unsigned char* p, size_t n) {
+  unsigned head = __atomic_load_n(&voice_ring_head, __ATOMIC_RELAXED);
+  const unsigned tail = __atomic_load_n(&voice_ring_tail, __ATOMIC_ACQUIRE);
+
+  while (n > 0 && head - tail < VOICE_RING_MAX) {
+    voice_ring[head % VOICE_RING_MAX] = *p++;
+    head++;
+    n--;
+  }
+  __atomic_store_n(&voice_ring_head, head, __ATOMIC_RELEASE);
+}
+
+static int voice_ring_take(void* data, size_t n) {
+  unsigned char* out = (unsigned char*)data;
+  unsigned tail = __atomic_load_n(&voice_ring_tail, __ATOMIC_RELAXED);
+  const unsigned head = __atomic_load_n(&voice_ring_head, __ATOMIC_ACQUIRE);
+  size_t i = 0;
+
+  while (i < n && tail != head) {
+    out[i++] = voice_ring[tail % VOICE_RING_MAX];
+    tail++;
+  }
+  __atomic_store_n(&voice_ring_tail, tail, __ATOMIC_RELEASE);
+  return (int)i;
+}
+
+/* ABI 3. The daemon's own fd, through the syscall so this does not re-enter
+ * the write hook. The daemon opens the voice port O_NONBLOCK (0x902), so a
+ * long upload fills the tty buffer and the next write comes back EAGAIN.
+ * GateOn is synchronous and the kernel drains the port at 921600 baud, so
+ * wait for room and carry on instead of failing the block. */
+static int borg_voice_write(const void* data, size_t n) {
+  const unsigned char* p = (const unsigned char*)data;
+  size_t left = n;
+
+  if (voice_fd < 0) return -ENODEV;
+  while (left > 0) {
+    const ssize_t wrote = (ssize_t)syscall(SYS_write, voice_fd, p, left);
+    if (wrote < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        struct pollfd pfd;
+        int ready;
+        pfd.fd = voice_fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        do {
+          ready = poll(&pfd, 1, 5000);
+        } while (ready < 0 && errno == EINTR);
+        if (ready < 0) return -errno;
+        if (ready == 0) return -ETIMEDOUT;
+        continue;
+      }
+      return -errno;
+    }
+    if (wrote == 0) return -EIO;
+    p += wrote;
+    left -= (size_t)wrote;
+  }
+  return (int)n;
+}
+
+/* ABI 3. The daemon reads after each block of its own, so when it is idle a
+ * unit's replies would sit in the tty and later be read as answers to a
+ * preload. While a slot is claimed and the ring is empty, drain the tty here.
+ * Poll first so the read cannot wait; the trylock keeps the daemon's read
+ * from being overtaken. */
+static int borg_voice_read(void* data, size_t n) {
+  int got = voice_ring_take(data, n);
+  if (got > 0 || n == 0) return got;
+
+  if (__atomic_load_n(&voice_claim_byte, __ATOMIC_ACQUIRE) < 0) return 0;
+  if (voice_fd < 0) return 0;
+  if (pthread_mutex_trylock(&voice_lock) != 0) return 0;
+
+  {
+    struct pollfd pfd;
+    unsigned char tmp[64];
+    pfd.fd = voice_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (poll(&pfd, 1, 0) <= 0) {
+      pthread_mutex_unlock(&voice_lock);
+      return 0;
+    }
+    /* Poll said the data is there and the lock keeps it: this does not wait. */
+    const ssize_t r = (ssize_t)syscall(SYS_read, voice_fd, tmp, sizeof tmp);
+    pthread_mutex_unlock(&voice_lock);
+    if (r > 0) {
+      voice_tap(tmp, (size_t)r);
+      got = voice_ring_take(data, n);
+    }
+  }
+  return got;
+}
+
+/* One accepted reply for one dropped block. A full ring loses it and the
+ * daemon retries, which is harmless. */
+static void voice_synth_push(void) {
+  unsigned head = __atomic_load_n(&voice_synth_head, __ATOMIC_RELAXED);
+  const unsigned tail = __atomic_load_n(&voice_synth_tail, __ATOMIC_ACQUIRE);
+
+  if (head - tail + 2 > sizeof voice_synth) return;
+  voice_synth[head % sizeof voice_synth] = 0xF1;
+  voice_synth[(head + 1) % sizeof voice_synth] = 0x00;
+  __atomic_store_n(&voice_synth_head, head + 2, __ATOMIC_RELEASE);
+}
+
+static int voice_synth_take(void* data, size_t n) {
+  unsigned char* out = (unsigned char*)data;
+  unsigned tail = __atomic_load_n(&voice_synth_tail, __ATOMIC_RELAXED);
+  const unsigned head = __atomic_load_n(&voice_synth_head, __ATOMIC_ACQUIRE);
+  size_t i = 0;
+
+  while (i < n && tail != head) {
+    out[i++] = voice_synth[tail % sizeof voice_synth];
+    tail++;
+  }
+  __atomic_store_n(&voice_synth_tail, tail, __ATOMIC_RELEASE);
+  return (int)i;
+}
+
+/* Returns 0, or -1 with errno set. */
+static int voice_raw_write(int fd, const unsigned char* p, size_t n) {
+  while (n > 0) {
+    const ssize_t wrote = (ssize_t)syscall(SYS_write, fd, p, n);
+    if (wrote < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    if (wrote == 0) {
+      errno = EIO;
+      return -1;
+    }
+    p += wrote;
+    n -= (size_t)wrote;
+  }
+  return 0;
+}
+
+/* Drops the daemon's complete 0x81 frames for the claimed slot; a partial
+ * frame cannot be attributed and is passed on. The byte count still reports
+ * success, because the synthetic F1 00 is what the daemon reads next. */
+static ssize_t voice_filter_write(int fd, const unsigned char* p, size_t n) {
+  const int claim = __atomic_load_n(&voice_claim_byte, __ATOMIC_ACQUIRE);
+  size_t i = 0;
+
+  if (claim < 0) return (ssize_t)syscall(SYS_write, fd, p, n);
+
+  while (i < n) {
+    if (p[i] != 0x81 || i + 8 > n) {
+      size_t j = i + 1;
+      while (j < n && p[j] != 0x81) j++;
+      if (voice_raw_write(fd, p + i, j - i) < 0) return -1;
+      i = j;
+      continue;
+    }
+
+    {
+      const size_t declared =
+          (size_t)p[i + 1] | ((size_t)p[i + 2] << 7);
+      if (declared < 8 || i + declared > n) {
+        /* Incomplete in this buffer: hand it on rather than guess. */
+        if (voice_raw_write(fd, p + i, n - i) < 0) return -1;
+        return (ssize_t)n;
+      }
+      if (p[i + 3] == (unsigned char)claim) {
+        voice_synth_push();
+      } else if (voice_raw_write(fd, p + i, declared) < 0) {
+        return -1;
+      }
+      i += declared;
+    }
+  }
+  return (ssize_t)n;
+}
+
+static int borg_voice_claim(int bank, int slot) {
+  if (bank < 0 || slot < 0 || bank > 7 || slot > 15) {
+    __atomic_store_n(&voice_claim_byte, -1, __ATOMIC_RELEASE);
+    return 0;
+  }
+  __atomic_store_n(&voice_claim_byte, (bank << 4) | slot, __ATOMIC_RELEASE);
+  return 0;
+}
+
 /* One class-0x85 id 0 frame: box header, then the text (at most 51 chars).
  *
  * The two colour bytes are the ink and the field behind it, in that order.
@@ -1012,7 +1225,8 @@ static const borg_unit_host unit_host_services = {
   (uint32_t)sizeof(borg_unit_host), BORG_UNIT_HOST_ABI,
   borg_transport, borg_request_transport, borg_last_key,
   borg_unit_midi_subscribe, borg_unit_midi_unsubscribe,
-  borg_unit_midi_try_write, borg_unit_port_name
+  borg_unit_midi_try_write, borg_unit_port_name,
+  borg_voice_write, borg_voice_read, borg_voice_claim
 };
 
 const borg_unit_host* borg_unit_host_get(uint32_t abi) {
@@ -2312,6 +2526,7 @@ int open(const char* path, int flags, ...) {
     fd = real_open(path, flags, mode);
   }
   if (fd >= 0 && path_is_panel(path)) panel_add(fd);
+  if (fd >= 0 && path_is_voice(path)) voice_fd = fd;
   return fd;
 }
 
@@ -2333,17 +2548,25 @@ int open64(const char* path, int flags, ...) {
     fd = real_open64(path, flags, mode);
   }
   if (fd >= 0 && path_is_panel(path)) panel_add(fd);
+  if (fd >= 0 && path_is_voice(path)) voice_fd = fd;
   return fd;
 }
 
 int dup(int oldfd) {
   const int fd = (int)syscall(SYS_dup, oldfd);
   if (fd >= 0 && panel_is(oldfd)) panel_add(fd);
+  if (fd >= 0 && oldfd == voice_fd) voice_fd = fd;
   return fd;
 }
 
 int close(int fd) {
   if (panel_is(fd)) panel_del(fd);
+  if (fd == voice_fd) {
+    voice_fd = -1;
+    __atomic_store_n(&voice_ring_tail,
+                     __atomic_load_n(&voice_ring_head, __ATOMIC_ACQUIRE),
+                     __ATOMIC_RELEASE);
+  }
   return (int)syscall(SYS_close, fd);
 }
 
@@ -2351,7 +2574,20 @@ int close(int fd) {
  * needs the next object's help, and a dlsym on the first write of the
  * daemon's life is the one thing this must not do. */
 ssize_t read(int fd, void* buf, size_t n) {
+  /* A dropped frame's answer is synthesized; the board never saw it. */
+  if (fd == voice_fd) {
+    const int synthesized = voice_synth_take(buf, n);
+    if (synthesized > 0) return (ssize_t)synthesized;
+  }
+
+  const int is_voice = fd == voice_fd;
+  if (is_voice) pthread_mutex_lock(&voice_lock);
   const ssize_t got = (ssize_t)syscall(SYS_read, fd, buf, n);
+  if (is_voice) pthread_mutex_unlock(&voice_lock);
+
+  if (got > 0 && is_voice) {
+    voice_tap((const unsigned char*)buf, (size_t)got);
+  }
   if (got > 0 && panel_is(fd)) {
     return (ssize_t)panel_scan(fd, (unsigned char*)buf, (size_t)got, n);
   }
@@ -2361,6 +2597,11 @@ ssize_t read(int fd, void* buf, size_t n) {
 ssize_t write(int fd, const void* buf, size_t n) {
   const unsigned char* p = (const unsigned char*)buf;
   size_t i = 0;
+
+  /* A claimed slot's blocks are answered without reaching the board. */
+  if (fd == voice_fd && voice_fd >= 0) {
+    return voice_filter_write(fd, (const unsigned char*)buf, n);
+  }
 
   if (!panel_is(fd)) return (ssize_t)syscall(SYS_write, fd, buf, n);
 
