@@ -13,17 +13,20 @@
     </div>
     <main>
         <h1>borg - extension framework</h1>
-        <p>A synth unit that switches <code>drumlogued</code> to run extensions in place. Select the unit and fire <code>GateOn()</code>: the daemon re-executes itself under an embedded preload object, same pid, with no rootfs writes. A power cycle restores everything.</p>
+        <p>Borg is a non-invasive extension framework for the Korg drumlogue (and microKORG2) that enables additional functionality to be loaded into the running synthesizer process without modifying firmware or the root filesystem. It works by re-executing the existing daemon under an embedded preload object, allowing menu extensions, MIDI transformations and modular functionality to run inside the host process. A power cycle restores the device to its original state. Read more about it here; <a href="https://blog.gbraad.nl/how-borg-came-about.html">How borg came about</a> and how it can extend the functionality of your drumlogue.</p>
 
-        <h2>Extensions</h2>
+        <h2>Functionality</h2>
         <ul>
-            <li>A status menu, opened with MUTE and MASTER.</li>
-            <li>An optional MIDI note and velocity transform.</li>
-            <li>A basic module system to extend the main unit</li>
+            <li>a status menu, opened with MUTE and MASTER.</li>
+            <li>use USB Mass Storage as userfs sessions</li>
+            <li>panel access for synth units</li>
+            <li>full MIDI access for synth units</li>
+            <li>remote command execution over MIDI sysex</li>
+            <li>and more ...</li>
         </ul>
 
-        <h2>Build</h2>
-        <p>Requires podman and a logue-sdk checkout.</p>
+        <h2>How to build</h2>
+        <p>Requires podman or docker and a logue-sdk checkout.</p>
         <pre>LOGUE_SDK_PATH=~/Projects/logue/logue-sdk ./build-drum.sh borg_drumlogue</pre>
         <p>Output: <code>bin/borg.drmlgunit</code>.</p>
 
@@ -32,16 +35,16 @@
             <li>Copy <code>borg.drmlgunit</code> to <code>userfs/Units/Synths/</code> on the instrument.</li>
             <li>Load the unit on a part.</li>
             <li>Save the program, so the daemon reloads it after the switch.</li>
-            <li>Fire <code>GateOn()</code>.</li>
+            <li>Fire <code>GateOn()</code> (by pressing USER).</li>
         </ol>
 
         <h2>Downloads</h2>
-        <p>Downloads are available at <a href="//itchio.rgrv.nl/borg-drumlogue">our store</a>. They are offered for free, though a small donation would be appreciated.</p>
+        <p>Downloads are available <a href="//itchio.rgrv.nl/borg-drumlogue">here</a>. They are offered for free, though a small donation would be appreciated.</p>
 
         <h2>Documentation</h2>
-        <p>See the <a href="https://github.com/gbraad-logue/borg/blob/main/borg_drumlogue/README.md">unit README</a> for details.</p>
+        <p>See the <a href="https://github.com/gbraad-logue/borg/blob/main/borg_drumlogue/README.md">unit README</a> for details, and join the discussion at <a href="https://discord.rgrv.nl/">our Discord server</a>.</p>
         <p>Support development by becoming a <a href="https://patreon.rgrv.nl/">Patron</a> or buying me a <a href="https://kofi.rgrv.nl">Ko-fi</a></p>
-        <p style="font-style: italic; font-size: 0.75em">"drumlogue" and "microKORG2" are trademarks of KORG Inc. Borg is independent work: it is not affiliated with, endorsed by or supported by KORG. Any damage is your own responsibility. No reverse engineering or disassembly was used. This relies on public files provided by the logue SDK. MIT-licensed.
+        <p style="font-style: italic; font-size: 0.75em">"drumlogue" and "microKORG2" are trademarks of KORG Inc. Borg is independent work: it is not affiliated with, endorsed by or supported by KORG. Any damage is your own responsibility. No reverse engineering or disassembly was used. This relies on public files provided by the logue SDK. MIT-licensed.</p>
     </main>
 </body>
 </html>
