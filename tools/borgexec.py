@@ -392,32 +392,51 @@ def wire_command(command):
 
 
 def main(argv):
+    # The port options belong to every mode, and argparse does not carry an
+    # option defined on the main parser into a subcommand's own parse:
+    # `borgexec.py ping -p hw:2,0` failed with "unrecognized arguments: -p
+    # hw:2,0", which reads as the port being ignored. The shared parser is
+    # therefore handed to the main parser AND to every subparser, with SUPPRESS
+    # defaults so a subparser that does not see the option leaves the value the
+    # main parser already stored alone. Either order now works.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--port", "-p", default=argparse.SUPPRESS,
+                        help="rawmidi node, or hw:card,device (default: the "
+                             "Korg gadget, else the only USB MIDI interface)")
+    common.add_argument("--timeout", "-t", type=float,
+                        default=argparse.SUPPRESS,
+                        help="seconds of silence that end a reply (default: %d)"
+                             % (MODULE_DEADLINE + 5))
+    common.add_argument("-q", "--quiet", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="suppress the command's output, keep its status")
+
     ap = argparse.ArgumentParser(
-        description="Talk to the exec.borgmodule over the drumlogue's MIDI.",
+        parents=[common],
+        description="Talk to the exec.borgmodule over the instrument's MIDI.",
         epilog="The module is loaded by the borg extension and answers on every "
                "port drumlogued reads, so the gadget, the DIN sockets and an "
                "interface in the host port all work. STATE on the module's page "
                "reads RUNNING while the kernel is working on an armed command, "
                "and COMMANDS counts the requests that arrived.",
     )
-    ap.add_argument("--port", "-p", default=None,
-                    help="rawmidi node, or hw:card,device (default: the "
-                         "drumlogue gadget, else the only USB MIDI interface)")
-    ap.add_argument("--timeout", "-t", type=float, default=MODULE_DEADLINE + 5,
-                    help="seconds of silence that end a reply (default: %d)"
-                         % (MODULE_DEADLINE + 5))
-    ap.add_argument("-q", "--quiet", action="store_true",
-                    help="suppress the command's output, keep its status")
     sub = ap.add_subparsers(dest="mode", required=True)
-    sub.add_parser("run", help="send one command and print what it said").add_argument(
+    sub.add_parser("run", parents=[common],
+                   help="send one command and print what it said").add_argument(
         "command")
-    sub.add_parser("ping", help="send the bare @exec and see whether a status "
-                                "comes back")
-    sub.add_parser("watch", help="decode whatever the drumlogue sends").add_argument(
+    sub.add_parser("ping", parents=[common],
+                   help="send the bare @exec and see whether a status "
+                        "comes back")
+    sub.add_parser("watch", parents=[common],
+                   help="decode whatever the instrument sends").add_argument(
         "--for", dest="seconds", type=float, default=None,
         help="stop after this many seconds (default: until ^C)")
 
     args = ap.parse_args(argv)
+    # The SUPPRESS defaults mean an option nobody passed is absent, not None.
+    args.port = getattr(args, "port", None)
+    args.timeout = getattr(args, "timeout", MODULE_DEADLINE + 5)
+    args.quiet = getattr(args, "quiet", False)
     node = node_for(args.port) if args.port else find_node()
     port = Port(node)
     print("# %s" % node, file=sys.stderr, flush=True)
